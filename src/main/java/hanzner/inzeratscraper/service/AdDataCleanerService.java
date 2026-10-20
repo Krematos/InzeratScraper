@@ -40,7 +40,7 @@ public class AdDataCleanerService {
 
     private static final Pattern PRICE_PATTERN = Pattern.compile(
             "(\\d{1,3}(?:[ .]\\d{3})++|\\d++)\\s*+(?:Kč|CZK|,-)",
-            Pattern.CASE_INSENSITIVE
+            Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE
     );
 
     public AdDataCleanerService(ObjectMapper objectMapper) {
@@ -124,19 +124,19 @@ public class AdDataCleanerService {
     public String basicRegexCleanDescription(String rawText) {
         if (rawText == null) return "";
         return rawText
-                // Odstranění typických bazarových frází (case-insensitive, bez super-lineárního backtrackingu)
-                .replaceAll("(?i)inzerát platí do smazání[^.\\n]*+\\.?", "")
-                .replaceAll("(?i)platí do smazání[^.\\n]*+\\.?", "")
-                .replaceAll("(?i)pouze osobní odběr[^.\\n]*+\\.?", "")
-                .replaceAll("(?i)na dobírku neposílám[^.\\n]*+\\.?", "")
-                .replaceAll("(?i)první kontakt\\s*+(?:prosím\\s*+)?(?:pouze\\s*+)?(?:emailem|mailem|e-mailem|sms)[^.\\n]*+\\.?", "")
-                .replaceAll("(?i)podívejte se (?:i )?na (?:mé |moje )?další inzeráty[^.\\n]*+\\.?", "")
-                .replaceAll("(?i)mrkněte (?:i )?na (?:mé |moje )?další inzeráty[^.\\n]*+\\.?", "")
-                .replaceAll("(?i)nevolejte prosím[^.\\n]*+\\.?", "")
+                // Odstranění typických bazarových frází (case-insensitive + unicode-case, bez super-lineárního backtrackingu)
+                .replaceAll("(?iu)inzerát platí do smazání[^.\\n]*+\\.?", "")
+                .replaceAll("(?iu)platí do smazání[^.\\n]*+\\.?", "")
+                .replaceAll("(?iu)pouze osobní odběr[^.\\n]*+\\.?", "")
+                .replaceAll("(?iu)na dobírku neposílám[^.\\n]*+\\.?", "")
+                .replaceAll("(?iu)první kontakt\\s*+(?:prosím\\s*+)?(?:pouze\\s*+)?(?:emailem|mailem|e-mailem|sms)[^.\\n]*+\\.?", "")
+                .replaceAll("(?iu)podívejte se (?:i )?na (?:mé |moje )?další inzeráty[^.\\n]*+\\.?", "")
+                .replaceAll("(?iu)mrkněte (?:i )?na (?:mé |moje )?další inzeráty[^.\\n]*+\\.?", "")
+                .replaceAll("(?iu)nevolejte prosím[^.\\n]*+\\.?", "")
                 // Odstranění e-mailových adres
-                .replaceAll("(?i)[a-z0-9._%+\\-]++@[a-z0-9\\-]++(?:\\.[a-z0-9\\-]++)*+\\.[a-z]{2,}+", "")
+                .replaceAll("(?i)(?:e-?mail[ \\t]*+:?[ \\t]*+)?[a-z0-9._%+\\-]++@[a-z0-9\\-]++(?:\\.[a-z0-9\\-]++)++", "")
                 // Odstranění českých telefonních čísel (např. +420 777 123 456, 777123456, tel: 602 111 222)
-                .replaceAll("(?i)(?:(?:tel\\.?|telefon|mobil)\\s*+:?\\s*+)?(?:\\+420\\s*+)?[67]\\d{2}[ \\-]?\\d{3}[ \\-]?\\d{3}\\b", "")
+                .replaceAll("(?i)(?:(?:tel\\.?|telefon|mobil)[ \\t]*+:?[ \\t]*+)?(?:\\+420[ \\-]?)?[67]\\d{2}[ \\-]?\\d{3}[ \\-]?\\d{3}(?!\\d)", "")
                 // Sjednocení vícenásobných odřádkování a mezer
                 .replaceAll("[ \\t]++\\n", "\n")
                 .replaceAll("\\n{3,}+", "\n\n")
@@ -144,7 +144,7 @@ public class AdDataCleanerService {
     }
 
     /**
-     * Přetížení využívající výchozí kategorie z application.properties.
+     * Přetížení využívající výchozí kategorie z application-example.properties.
      */
     public CleanedProductDto cleanWithAi(RawAdDto rawAd) throws IOException, InterruptedException {
         return cleanWithAi(rawAd, this.defaultCategories);

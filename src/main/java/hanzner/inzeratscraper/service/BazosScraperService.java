@@ -246,12 +246,14 @@ public class BazosScraperService {
      */
     public String extractTextWithLineBreaks(Element element) {
         if (element == null) return "";
-        String html = element.html();
-        Document.OutputSettings outputSettings = new Document.OutputSettings().prettyPrint(false);
-        String withNewLines = html.replaceAll("(?i)<br\\s*+/?>", "\n").replaceAll("(?i)</p>", "\n\n");
-        return Jsoup.clean(withNewLines, "", Safelist.none(), outputSettings)
+        Element clone = element.clone();
+        clone.select("br").after("\\n");
+        clone.select("p").after("\\n\\n");
+        return clone.text()
+                .replace("\\n ", "\n")
+                .replace(" \\n", "\n")
+                .replace("\\n", "\n")
                 .replace("&nbsp;", " ")
-                .replace("&amp;", "&")
                 .trim();
     }
 
@@ -261,18 +263,11 @@ public class BazosScraperService {
      */
     public String extractPrice(Document doc) {
         // V novějším layoutu Bazoše: <tr><td>Cena:</td><td><b>1 500 Kč</b></td></tr>
-        Element priceRow = doc.selectFirst("td.listadvlevo tr:contains(Cena:), table tr:contains(Cena:)");
-        if (priceRow != null) {
-            Elements tds = priceRow.select("td");
-            if (tds.size() >= 2) {
-                String text = tds.get(1).text().trim();
-                if (!text.isEmpty()) {
-                    return text;
-                }
-            }
-            Element boldPrice = priceRow.selectFirst("b, strong");
-            if (boldPrice != null && !boldPrice.text().isBlank()) {
-                return boldPrice.text().trim();
+        Element labelTd = doc.selectFirst("td.listadvlevo td:matchesOwn((?iu)^\\s*Cena:\\s*$), table td:matchesOwn((?iu)^\\s*Cena:\\s*$)");
+        if (labelTd != null) {
+            Element valueTd = labelTd.nextElementSibling();
+            if (valueTd != null && !valueTd.text().isBlank()) {
+                return valueTd.text().trim();
             }
         }
         // Fallback na span.cena
@@ -287,16 +282,18 @@ public class BazosScraperService {
      * Najde PSČ a město v tabulce pod inzerátem (řádek "Lokalita:").
      */
     public String extractLocation(Document doc) {
-        Element locRow = doc.selectFirst("td.listadvlevo tr:contains(Lokalita:), table tr:contains(Lokalita:)");
-        if (locRow != null) {
-            // V prvním odkazu bývá PSČ, ve druhém město
-            String linksText = locRow.select("a").text().trim();
-            if (!linksText.isEmpty()) {
-                return linksText;
+        Element labelTd = doc.selectFirst("td.listadvlevo td:matchesOwn((?iu)^\\s*Lokalita:\\s*$), table td:matchesOwn((?iu)^\\s*Lokalita:\\s*$)");
+        if (labelTd != null) {
+            Element parentRow = labelTd.parent();
+            if (parentRow != null) {
+                String linksText = parentRow.select("a").text().trim();
+                if (!linksText.isEmpty()) {
+                    return linksText;
+                }
             }
-            Elements tds = locRow.select("td");
-            if (tds.size() >= 2) {
-                return tds.get(1).text().trim();
+            Element valueTd = labelTd.nextElementSibling();
+            if (valueTd != null && !valueTd.text().isBlank()) {
+                return valueTd.text().trim();
             }
         }
         return "";

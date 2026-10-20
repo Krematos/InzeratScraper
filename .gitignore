@@ -35,3 +35,5 @@ build/
 ### Doc ###
 .doc/
 doc
+
+application-local.properties
