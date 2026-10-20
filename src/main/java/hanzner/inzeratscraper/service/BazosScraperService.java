@@ -15,7 +15,7 @@ import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.net.URI;
-import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -30,8 +30,8 @@ public class BazosScraperService {
 
     private static final String USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-    private static final Pattern AD_ID_PATTERN = Pattern.compile("/inzerat/(\\d+)/");
-    private static final Pattern AD_ID_FALLBACK_PATTERN = Pattern.compile("(\\d+)\\.htm");
+    private static final Pattern AD_ID_PATTERN = Pattern.compile("/inzerat/(\\d++)/");
+    private static final Pattern AD_ID_FALLBACK_PATTERN = Pattern.compile("(?<!\\d)(\\d++)\\.htm");
 
     private final RawScrapedAdRepository rawScrapedAdRepository;
 
@@ -44,98 +44,125 @@ public class BazosScraperService {
      * Příklad vstupní URL: "https://www.bazos.cz/hodnoceni.php?idmail=123456&idphone=789012&jmeno=Jan"
      */
     public List<RawAdDto> scrapeAllUserAds(String baseUserProfileUrl) {
+        log.info("Začínám hledat odkazy na inzeráty z profilu: {}", baseUserProfileUrl);
+
+        Set<String> allAdUrls = collectAllAdUrls(baseUserProfileUrl);
+        log.info("Celkem nalezeno {} unikátních inzerátů. Začínám stahovat detaily...", allAdUrls.size());
+
+        return scrapeDetailsForUrls(allAdUrls);
+    }
+
+    private Set<String> collectAllAdUrls(String baseUserProfileUrl) {
         Set<String> allAdUrls = new LinkedHashSet<>();
         int offset = 0;
         int pageSize = 20;
 
-        log.info("Začínám hledat odkazy na inzeráty z profilu: {}", baseUserProfileUrl);
+        while (fetchNextListingPage(baseUserProfileUrl, offset, allAdUrls)) {
+            offset += pageSize;
+            sleepWithJitter(1000, 2000);
+        }
+        return allAdUrls;
+    }
 
-        // 1. FÁZE: Posbírání všech URL adres jednotlivých inzerátů ze stránkování
-        while (true) {
-            String pageUrl = buildPaginatedUrl(baseUserProfileUrl, offset);
-            log.info("Načítám stránku výpisu (offset {}): {}", offset, pageUrl);
+    private boolean fetchNextListingPage(String baseUserProfileUrl, int offset, Set<String> allAdUrls) {
+        String pageUrl = buildPaginatedUrl(baseUserProfileUrl, offset);
+        log.info("Načítám stránku výpisu (offset {}): {}", offset, pageUrl);
 
-            try {
-                Document doc = fetchDocument(pageUrl);
-                // Na Bazoši jsou nadpisy v seznamu uvnitř <div class="inzeraty inzeratyflex"> -> <h2 class="nadpis"><a href="...">
-                Elements adLinks = doc.select("div.inzeraty h2.nadpis a[href*='/inzerat/'], span.nadpis a[href*='/inzerat/']");
+        try {
+            Document doc = fetchDocument(pageUrl);
+            Elements adLinks = doc.select("div.inzeraty h2.nadpis a[href*='/inzerat/'], span.nadpis a[href*='/inzerat/']");
+            if (adLinks.isEmpty()) {
+                log.info("Na offsetu {} už nejsou žádné další inzeráty. Končím hledání.", offset);
+                return false;
+            }
+            return addNewLinksFromPage(adLinks, allAdUrls) > 0;
+        } catch (HttpStatusException e) {
+            logListingHttpError(e, pageUrl);
+            return false;
+        } catch (Exception e) {
+            log.error("Chyba při načítání stránky seznamu {}: {}", pageUrl, e.getMessage());
+            return false;
+        }
+    }
 
-                if (adLinks.isEmpty()) {
-                    log.info("Na offsetu {} už nejsou žádné další inzeráty. Končím hledání.", offset);
-                    break;
-                }
-
-                int newLinksOnPage = 0;
-                for (Element link : adLinks) {
-                    // abs:href automaticky doplní správnou subdoménu (např. https://pc.bazos.cz/inzerat/...)
-                    String absUrl = link.attr("abs:href");
-                    if (!absUrl.isBlank() && allAdUrls.add(absUrl)) {
-                        newLinksOnPage++;
-                    }
-                }
-
-                // Pojistka: Pokud Bazoš při přestřelení offsetu vrátí pořád tu samou poslední stránku, vyskočíme
-                if (newLinksOnPage == 0) {
-                    break;
-                }
-
-                offset += pageSize;
-                sleepWithJitter(1000, 2000); // Krátká pauza mezi stránkami seznamu
-
-            } catch (HttpStatusException e) {
-                int status = e.getStatusCode();
-                if (status == 403 || status == 429) {
-                    log.warn("Rate-limit nebo blokace (HTTP {}) při načítání výpisu {}. Bezpečně ukončuji hledání dalších stránek.", status, pageUrl);
-                } else {
-                    log.error("HTTP chyba {} při načítání stránky seznamu {}: {}", status, pageUrl, e.getMessage());
-                }
-                break;
-            } catch (Exception e) {
-                log.error("Chyba při načítání stránky seznamu {}: {}", pageUrl, e.getMessage());
-                break;
+    private int addNewLinksFromPage(Elements adLinks, Set<String> allAdUrls) {
+        int newLinksOnPage = 0;
+        for (Element link : adLinks) {
+            String absUrl = link.attr("abs:href");
+            if (!absUrl.isBlank() && allAdUrls.add(absUrl)) {
+                newLinksOnPage++;
             }
         }
+        return newLinksOnPage;
+    }
 
-        log.info("Celkem nalezeno {} unikátních inzerátů. Začínám stahovat detaily...", allAdUrls.size());
+    private void logListingHttpError(HttpStatusException e, String pageUrl) {
+        int status = e.getStatusCode();
+        if (status == 403 || status == 429) {
+            log.warn("Rate-limit nebo blokace (HTTP {}) při načítání výpisu {}. Bezpečně ukončuji hledání dalších stránek.", status, pageUrl);
+        } else {
+            log.error("HTTP chyba {} při načítání stránky seznamu {}: {}", status, pageUrl, e.getMessage());
+        }
+    }
 
-        // 2. FÁZE: Stažení detailu každého inzerátu (s inkrementální kontrolou a okamžitým ukládáním do DB)
+    private List<RawAdDto> scrapeDetailsForUrls(Set<String> allAdUrls) {
         List<RawAdDto> results = new ArrayList<>();
         int counter = 0;
+        int total = allAdUrls.size();
 
         for (String adUrl : allAdUrls) {
             counter++;
             String externalId = "BAZOS_" + extractAdId(adUrl);
 
-            if (rawScrapedAdRepository != null && rawScrapedAdRepository.existsByExternalId(externalId)) {
-                log.info("[{}/{}] Inzerát {} již existuje ve staging DB, přeskakuji stahování: {}", counter, allAdUrls.size(), externalId, adUrl);
+            if (isAlreadyScraped(externalId)) {
+                log.info("[{}/{}] Inzerát {} již existuje ve staging DB, přeskakuji stahování: {}", counter, total, externalId, adUrl);
                 continue;
             }
 
-            try {
-                log.info("[{}/{}] Stahuji detail inzerátu ({}): {}", counter, allAdUrls.size(), externalId, adUrl);
-                RawAdDto dto = scrapeSingleAdDetail(adUrl);
-                saveToStagingDb(dto);
-                results.add(dto);
-
-                // Pauza 1.5 až 3.5 vteřiny mezi detaily proti IP banu
-                sleepWithJitter(1500, 3500);
-            } catch (HttpStatusException e) {
-                int status = e.getStatusCode();
-                if (status == 404) {
-                    log.warn("[{}/{}] Inzerát {} již byl smazán (HTTP 404), přeskakuji: {}", counter, allAdUrls.size(), externalId, adUrl);
-                } else if (status == 403 || status == 429) {
-                    log.warn("[{}/{}] Rate-limit nebo IP ban (HTTP {}) u inzerátu {}. Bezpečně ukončuji stahování, dosud stažené inzeráty ({}) zůstávají uložené.",
-                            counter, allAdUrls.size(), status, adUrl, results.size());
-                    break;
-                } else {
-                    log.error("[{}/{}] HTTP chyba {} u inzerátu {}: {}", counter, allAdUrls.size(), status, adUrl, e.getMessage());
-                }
-            } catch (Exception e) {
-                log.error("Selhalo parsování inzerátu {}: {}", adUrl, e.getMessage());
+            if (!scrapeAndSaveSingleAd(adUrl, externalId, counter, total, results)) {
+                break;
             }
         }
-
         return results;
+    }
+
+    private boolean isAlreadyScraped(String externalId) {
+        return rawScrapedAdRepository != null && rawScrapedAdRepository.existsByExternalId(externalId);
+    }
+
+    private boolean scrapeAndSaveSingleAd(String adUrl, String externalId, int counter, int total, List<RawAdDto> results) {
+        try {
+            log.info("[{}/{}] Stahuji detail inzerátu ({}): {}", counter, total, externalId, adUrl);
+            RawAdDto dto = scrapeSingleAdDetail(adUrl);
+            saveToStagingDb(dto);
+            results.add(dto);
+            sleepWithJitter(1500, 3500);
+            return true;
+        } catch (HttpStatusException e) {
+            return !shouldAbortOnDetailHttpError(e, adUrl, externalId, counter, total, results.size());
+        } catch (Exception e) {
+            log.error("Selhalo parsování inzerátu {}: {}", adUrl, e.getMessage());
+            return true;
+        }
+    }
+
+    private boolean shouldAbortOnDetailHttpError(HttpStatusException e, String adUrl, String externalId, int counter, int total, int savedCount) {
+        int status = e.getStatusCode();
+        return switch (status) {
+            case 404 -> {
+                log.warn("[{}/{}] Inzerát {} již byl smazán (HTTP 404), přeskakuji: {}", counter, total, externalId, adUrl);
+                yield false;
+            }
+            case 403, 429 -> {
+                log.warn("[{}/{}] Rate-limit nebo IP ban (HTTP {}) u inzerátu {}. Bezpečně ukončuji stahování, dosud stažené inzeráty ({}) zůstávají uložené.",
+                        counter, total, status, adUrl, savedCount);
+                yield true;
+            }
+            default -> {
+                log.error("[{}/{}] HTTP chyba {} u inzerátu {}: {}", counter, total, status, adUrl, e.getMessage());
+                yield false;
+            }
+        };
     }
 
     /**
@@ -193,8 +220,8 @@ public class BazosScraperService {
                             .rawImages(dto.rawImages() != null ? new ArrayList<>(dto.rawImages()) : new ArrayList<>())
                             .status(AdProcessingStatus.SCRAPED)
                             .priceNeedsReview(false)
-                            .scrapedAt(LocalDateTime.now())
-                            .updatedAt(LocalDateTime.now())
+                            .scrapedAt(Instant.now())
+                            .updatedAt(Instant.now())
                             .build();
                     return rawScrapedAdRepository.save(entity);
                 });
@@ -221,7 +248,7 @@ public class BazosScraperService {
         if (element == null) return "";
         String html = element.html();
         Document.OutputSettings outputSettings = new Document.OutputSettings().prettyPrint(false);
-        String withNewLines = html.replaceAll("(?i)<br\\s*/?>", "\n").replaceAll("(?i)</p>", "\n\n");
+        String withNewLines = html.replaceAll("(?i)<br\\s*+/?>", "\n").replaceAll("(?i)</p>", "\n\n");
         return Jsoup.clean(withNewLines, "", Safelist.none(), outputSettings)
                 .replace("&nbsp;", " ")
                 .replace("&amp;", "&")
@@ -312,7 +339,7 @@ public class BazosScraperService {
     public String convertThumbnailUrlToFullSize(String url) {
         if (url == null) return "";
         // Odstraní 't' v cestě /img/1t/ -> /img/1/
-        return url.replaceAll("/img/(\\d+)t/", "/img/$1/");
+        return url.replaceAll("/img/(\\d++)t/", "/img/$1/");
     }
 
     public String extractAdId(String url) {
@@ -341,7 +368,7 @@ public class BazosScraperService {
 
     public String buildPaginatedUrl(String baseUrl, int offset) {
         // Odstraníme případný existující parametr crz, ať ho nedublujeme
-        String cleanUrl = baseUrl.replaceAll("[&?]crz=\\d+", "");
+        String cleanUrl = baseUrl.replaceAll("[&?]crz=\\d++", "");
         if (offset == 0) {
             return cleanUrl;
         }

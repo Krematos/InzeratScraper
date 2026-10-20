@@ -20,7 +20,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
-import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -76,15 +76,15 @@ public class RawScrapedAd {
     @Column(columnDefinition = "TEXT")
     private String errorMessage;
 
-    private LocalDateTime scrapedAt;
+    private Instant scrapedAt;
 
-    private LocalDateTime updatedAt;
+    private Instant updatedAt;
 
     @PrePersist
     protected void onCreate() {
-        LocalDateTime now = LocalDateTime.now();
+        Instant now = Instant.now();
         if (this.scrapedAt == null) {
-            this.scrapedAt = now;
+            this.scrapedAt = Instant.now();
         }
         this.updatedAt = now;
         if (this.status == null) {
@@ -94,6 +94,6 @@ public class RawScrapedAd {
 
     @PreUpdate
     protected void onUpdate() {
-        this.updatedAt = LocalDateTime.now();
+        this.updatedAt = Instant.now();
     }
 }
