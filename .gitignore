@@ -37,3 +37,6 @@ build/
 doc
 
 application-local.properties
+application.properties
+
+data/staging-db.mv.db

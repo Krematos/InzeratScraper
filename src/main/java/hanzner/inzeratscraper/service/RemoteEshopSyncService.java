@@ -5,6 +5,7 @@ import hanzner.inzeratscraper.entity.AdProcessingStatus;
 import hanzner.inzeratscraper.entity.RawScrapedAd;
 import hanzner.inzeratscraper.repository.RawScrapedAdRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
@@ -27,17 +28,24 @@ public class RemoteEshopSyncService {
     private final RawScrapedAdRepository rawScrapedAdRepository;
     private final ObjectMapper objectMapper;
 
+    @Autowired
     public RemoteEshopSyncService(
-            @Value("${eshop.remote.url}") String eshopUrl,
-            @Value("${eshop.remote.api-key}") String apiKey,
+            @Value("${eshop.remote.url:http://localhost:8080}") String eshopUrl,
+            @Value("${eshop.remote.api-key:}") String apiKey,
             RawScrapedAdRepository rawScrapedAdRepository,
             ObjectMapper objectMapper) {
+        this(RestClient.builder().baseUrl(eshopUrl).build(), apiKey, rawScrapedAdRepository, objectMapper);
+    }
+
+    public RemoteEshopSyncService(
+            RestClient restClient,
+            String apiKey,
+            RawScrapedAdRepository rawScrapedAdRepository,
+            ObjectMapper objectMapper) {
+        this.restClient = restClient;
         this.apiKey = apiKey;
         this.rawScrapedAdRepository = rawScrapedAdRepository;
         this.objectMapper = objectMapper;
-        this.restClient = RestClient.builder()
-                .baseUrl(eshopUrl)
-                .build();
     }
 
     /**
