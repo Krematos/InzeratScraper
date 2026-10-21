@@ -272,13 +272,9 @@ public class AdDataCleanerService {
         }
 
         boolean isGemini = llmApiUrl.contains("googleapis.com") || llmApiUrl.contains("gemini");
-        String requestUrl = llmApiUrl;
         String requestBodyJson;
 
         if (isGemini) {
-            if (!requestUrl.contains("key=")) {
-                requestUrl += (requestUrl.contains("?") ? "&" : "?") + "key=" + llmApiKey;
-            }
             Map<String, Object> geminiPayload = new LinkedHashMap<>();
             geminiPayload.put("contents", List.of(
                     Map.of("parts", List.of(Map.of("text", prompt)))
@@ -305,12 +301,14 @@ public class AdDataCleanerService {
         while (true) {
             attempt++;
             HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
-                    .uri(URI.create(requestUrl))
+                    .uri(URI.create(llmApiUrl))
                     .timeout(Duration.ofSeconds(45))
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(requestBodyJson));
 
-            if (!isGemini) {
+            if (isGemini) {
+                reqBuilder.header("x-goog-api-key", llmApiKey);
+            } else {
                 reqBuilder.header("Authorization", "Bearer " + llmApiKey);
             }
 

@@ -7,8 +7,12 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 class BazosScraperServiceTest {
 
@@ -26,6 +30,86 @@ class BazosScraperServiceTest {
 
         String fallbackUrl = "https://www.bazos.cz/ostatni/194827164.htm";
         assertEquals("194827164", scraperService.extractAdId(fallbackUrl));
+
+        // Fallback SHA-256 otisk ignoruje query parametry a nikdy nevrátí zápornou hodnotu
+        String unusualUrl1 = "https://stroje.bazos.cz/detail/vrtacka-bosch?utm_source=test";
+        String unusualUrl2 = "https://stroje.bazos.cz/detail/vrtacka-bosch?utm_source=other";
+        String hash1 = scraperService.extractAdId(unusualUrl1);
+        String hash2 = scraperService.extractAdId(unusualUrl2);
+        assertEquals(hash1, hash2);
+        assertFalse(hash1.startsWith("-"));
+        assertEquals(16, hash1.length());
+        assertNotEquals(hash1, scraperService.extractAdId("https://stroje.bazos.cz/detail/jiny-inzerat"));
+    }
+
+    @Test
+    void testResolveNextOffsetFromDomAndFallback() {
+        String htmlWithPagination = """
+                <html>
+                  <body>
+                    <div class="strankovani">
+                      <a href="hodnoceni.php?idmail=123&crz=15">2</a>
+                      <a href="hodnoceni.php?idmail=123&crz=30">3</a>
+                    </div>
+                  </body>
+                </html>
+                """;
+        Document docWithPagination = Jsoup.parse(htmlWithPagination, "https://www.bazos.cz/");
+        assertEquals(15, scraperService.resolveNextOffset(docWithPagination, 0, 15));
+        assertEquals(30, scraperService.resolveNextOffset(docWithPagination, 15, 15));
+
+        Document docWithoutPagination = Jsoup.parse("<html><body></body></html>", "https://www.bazos.cz/");
+        assertEquals(18, scraperService.resolveNextOffset(docWithoutPagination, 0, 18));
+    }
+
+    @Test
+    void testHoneypotPageAndAdLimitsAreEnforced() {
+        AtomicInteger fetchedPages = new AtomicInteger(0);
+
+        // Nastavíme přísný limit: max 2 stránky, max 3 inzeráty
+        BazosScraperService boundedScraper = new BazosScraperService(null, 2, 3, 1024 * 1024) {
+            @Override
+            protected Document fetchDocument(String url) {
+                int page = fetchedPages.incrementAndGet();
+                int baseId = page * 100;
+                String html = """
+                        <html>
+                          <body>
+                            <div class="inzeraty">
+                              <h2 class="nadpis"><a href="https://stroje.bazos.cz/inzerat/%d/a.php">A</a></h2>
+                              <h2 class="nadpis"><a href="https://stroje.bazos.cz/inzerat/%d/b.php">B</a></h2>
+                            </div>
+                            <div class="strankovani">
+                              <a href="hodnoceni.php?idmail=1&crz=%d">Další</a>
+                            </div>
+                          </body>
+                        </html>
+                        """.formatted(baseId + 1, baseId + 2, page * 20);
+                return Jsoup.parse(html, "https://www.bazos.cz/");
+            }
+
+            @Override
+            public Set<String> collectAllAdUrls(String baseUserProfileUrl) {
+                return super.collectAllAdUrls(baseUserProfileUrl);
+            }
+        };
+
+        Set<String> urls = ((BazosScraperService) boundedScraper).scrapeAllUserAds("https://www.bazos.cz/hodnoceni.php?idmail=1")
+                .stream()
+                .map( hanzner.inzeratscraper.dto.RawAdDto::url)
+                .collect(java.util.stream.Collectors.toSet());
+
+        // I když stránkování generuje nekonečně mnoho dalších odkazů, scraper zastaví na maxAds = 3
+        assertEquals(3, urls.size());
+    }
+
+    @Test
+    void testBuildPaginatedUrlCleansExistingCrzParamSafely() {
+        String urlWithLeadingCrz = "https://www.bazos.cz/hodnoceni.php?crz=20&idmail=5412977";
+        assertEquals("https://www.bazos.cz/hodnoceni.php?idmail=5412977&crz=40",
+                scraperService.buildPaginatedUrl(urlWithLeadingCrz, 40));
+        assertEquals("https://www.bazos.cz/hodnoceni.php?idmail=5412977",
+                scraperService.buildPaginatedUrl(urlWithLeadingCrz, 0));
     }
 
     @Test
