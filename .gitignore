@@ -39,4 +39,7 @@ doc
 application-local.properties
 application.properties
 
-data/staging-db.mv.db
+### Lokální data a H2 databáze ###
+data/
+*.mv.db
+*.trace.db

@@ -21,15 +21,18 @@ public class MigrationController {
     private final MigrationOrchestratorService orchestratorService;
 
     /**
-     * Fáze 1: Stažení inzerátů z profilu Bazoše do lokální H2 databáze.
-     * Příklad: POST /api/migration/scrape?profileUrl=https://www.bazos.cz/hodnoceni.php?idmail=...
+     * Fáze 1: Stažení inzerátů z profilu Bazoše do lokální H2 databáze a volitelná záloha fotek.
+     * Příklad: POST /api/migration/scrape?profileUrl=https://www.bazos.cz/hodnoceni.php?idmail=...&downloadImages=true
      */
     @PostMapping("/scrape")
-    public ResponseEntity<Map<String, Object>> scrapeProfile(@RequestParam String profileUrl) {
-        int newlyScraped = orchestratorService.scrapeProfileToStaging(profileUrl);
+    public ResponseEntity<Map<String, Object>> scrapeProfile(
+            @RequestParam String profileUrl,
+            @RequestParam(defaultValue = "true") boolean downloadImages) {
+        int newlyScraped = orchestratorService.scrapeProfileToStaging(profileUrl, downloadImages);
         return ResponseEntity.ok(Map.of(
                 "phase", "SCRAPE",
                 "profileUrl", profileUrl,
+                "downloadImages", downloadImages,
                 "newlyScrapedCount", newlyScraped
         ));
     }

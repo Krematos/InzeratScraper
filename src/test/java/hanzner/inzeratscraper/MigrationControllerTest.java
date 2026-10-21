@@ -36,16 +36,17 @@ class MigrationControllerTest {
     @Test
     void testScrapeProfileEndpoint() {
         String profileUrl = "https://www.bazos.cz/hodnoceni.php?idmail=5412977";
-        when(orchestratorService.scrapeProfileToStaging(profileUrl)).thenReturn(12);
+        when(orchestratorService.scrapeProfileToStaging(profileUrl, true)).thenReturn(12);
 
-        ResponseEntity<Map<String, Object>> response = controller.scrapeProfile(profileUrl);
+        ResponseEntity<Map<String, Object>> response = controller.scrapeProfile(profileUrl, true);
 
         assertEquals(HttpStatus.OK, response.getStatusCode());
         assertNotNull(response.getBody());
         assertEquals("SCRAPE", response.getBody().get("phase"));
         assertEquals(profileUrl, response.getBody().get("profileUrl"));
+        assertEquals(true, response.getBody().get("downloadImages"));
         assertEquals(12, response.getBody().get("newlyScrapedCount"));
-        verify(orchestratorService).scrapeProfileToStaging(profileUrl);
+        verify(orchestratorService).scrapeProfileToStaging(profileUrl, true);
     }
 
     @Test

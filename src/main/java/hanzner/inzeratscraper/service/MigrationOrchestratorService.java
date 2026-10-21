@@ -10,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import tools.jackson.databind.ObjectMapper;
 
+import java.nio.file.Path;
 import java.util.List;
 
 @Slf4j
@@ -18,17 +19,38 @@ import java.util.List;
 public class MigrationOrchestratorService {
 
     private final BazosScraperService bazosScraperService;
+    private final ImageDownloadService imageDownloadService;
     private final AdDataCleanerService adDataCleanerService;
     private final RemoteEshopSyncService remoteEshopSyncService;
     private final RawScrapedAdRepository rawScrapedAdRepository;
     private final ObjectMapper objectMapper;
 
     /**
-     * Fáze 1: Stáhne inzeráty z uživatelského profilu na Bazoši a uloží je do lokální staging DB.
+     * Fáze 1: Stáhne inzeráty z uživatelského profilu na Bazoši, uloží je do lokální staging DB
+     * a zálohuje obrázky na lokální disk.
      */
     public int scrapeProfileToStaging(String profileUrl) {
-        log.info("Spouštím Fázi 1 (Scrape do Staging DB) pro profil: {}", profileUrl);
+        return scrapeProfileToStaging(profileUrl, true);
+    }
+
+    /**
+     * Fáze 1: Stáhne inzeráty z uživatelského profilu na Bazoši do lokální staging DB
+     * a volitelně stáhne obrázky přes ImageDownloadService.
+     */
+    public int scrapeProfileToStaging(String profileUrl, boolean downloadImages) {
+        log.info("Spouštím Fázi 1 (Scrape do Staging DB, downloadImages={}) pro profil: {}", downloadImages, profileUrl);
         List<RawAdDto> newlyScraped = bazosScraperService.scrapeAllUserAds(profileUrl);
+
+        if (downloadImages && !newlyScraped.isEmpty()) {
+            int downloadedFilesCount = 0;
+            for (RawAdDto ad : newlyScraped) {
+                List<Path> savedImages = imageDownloadService.downloadImagesForAd(ad.externalId(), ad.rawImages());
+                downloadedFilesCount += savedImages.size();
+            }
+            log.info("Pro {} nově stažených inzerátů uloženo celkem {} obrázků na disk.",
+                    newlyScraped.size(), downloadedFilesCount);
+        }
+
         log.info("Fáze 1 dokončena. Nově staženo a uloženo {} inzerátů.", newlyScraped.size());
         return newlyScraped.size();
     }

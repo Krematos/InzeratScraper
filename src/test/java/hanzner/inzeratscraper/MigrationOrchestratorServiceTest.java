@@ -7,6 +7,7 @@ import hanzner.inzeratscraper.entity.RawScrapedAd;
 import hanzner.inzeratscraper.repository.RawScrapedAdRepository;
 import hanzner.inzeratscraper.service.AdDataCleanerService;
 import hanzner.inzeratscraper.service.BazosScraperService;
+import hanzner.inzeratscraper.service.ImageDownloadService;
 import hanzner.inzeratscraper.service.MigrationOrchestratorService;
 import hanzner.inzeratscraper.service.RemoteEshopSyncService;
 import org.junit.jupiter.api.BeforeEach;
@@ -18,6 +19,7 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
@@ -26,6 +28,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -36,6 +40,9 @@ class MigrationOrchestratorServiceTest {
 
     @Mock
     private BazosScraperService bazosScraperService;
+
+    @Mock
+    private ImageDownloadService imageDownloadService;
 
     @Mock
     private AdDataCleanerService adDataCleanerService;
@@ -54,6 +61,7 @@ class MigrationOrchestratorServiceTest {
         objectMapper = new ObjectMapper();
         orchestratorService = new MigrationOrchestratorService(
                 bazosScraperService,
+                imageDownloadService,
                 adDataCleanerService,
                 remoteEshopSyncService,
                 rawScrapedAdRepository,
@@ -62,18 +70,39 @@ class MigrationOrchestratorServiceTest {
     }
 
     @Test
-    void testScrapeProfileToStagingReturnsScrapedCount() {
+    void testScrapeProfileToStagingDownloadsImagesByDefault() {
         String url = "https://www.bazos.cz/hodnoceni.php?idmail=123";
+        List<String> imgs1 = List.of("https://www.bazos.cz/img/1/1.jpg");
+        List<String> imgs2 = List.of("https://www.bazos.cz/img/1/2.jpg");
         List<RawAdDto> scraped = List.of(
-                new RawAdDto("1", "u1", "stroje", "T1", "D1", "100 Kč", "Praha", List.of()),
-                new RawAdDto("2", "u2", "auto", "T2", "D2", "200 Kč", "Brno", List.of())
+                new RawAdDto("1", "u1", "stroje", "T1", "D1", "100 Kč", "Praha", imgs1),
+                new RawAdDto("2", "u2", "auto", "T2", "D2", "200 Kč", "Brno", imgs2)
         );
         when(bazosScraperService.scrapeAllUserAds(url)).thenReturn(scraped);
+        when(imageDownloadService.downloadImagesForAd(anyString(), anyList()))
+                .thenReturn(List.of(Path.of("data/images/1/img_01.jpg")));
 
         int count = orchestratorService.scrapeProfileToStaging(url);
 
         assertEquals(2, count);
         verify(bazosScraperService).scrapeAllUserAds(url);
+        verify(imageDownloadService).downloadImagesForAd("1", imgs1);
+        verify(imageDownloadService).downloadImagesForAd("2", imgs2);
+    }
+
+    @Test
+    void testScrapeProfileToStagingSkipsImageDownloadWhenDisabled() {
+        String url = "https://www.bazos.cz/hodnoceni.php?idmail=123";
+        List<RawAdDto> scraped = List.of(
+                new RawAdDto("1", "u1", "stroje", "T1", "D1", "100 Kč", "Praha", List.of("https://www.bazos.cz/img/1/1.jpg"))
+        );
+        when(bazosScraperService.scrapeAllUserAds(url)).thenReturn(scraped);
+
+        int count = orchestratorService.scrapeProfileToStaging(url, false);
+
+        assertEquals(1, count);
+        verify(bazosScraperService).scrapeAllUserAds(url);
+        verify(imageDownloadService, never()).downloadImagesForAd(anyString(), anyList());
     }
 
     @Test
