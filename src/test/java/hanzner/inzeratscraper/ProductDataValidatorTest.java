@@ -45,6 +45,18 @@ class ProductDataValidatorTest {
     }
 
     @Test
+    void testValidateAndNormalizeNamePreservesAmpersandAndLessThanWithoutHtmlEntities() {
+        List<String> reasons = new ArrayList<>();
+        String raw = "Bosch & Makita 5 < 6 mm";
+        String normalized = validator.validateAndNormalizeName(raw, "Fallback", "BAZOS_12345", reasons);
+
+        assertEquals("Bosch & Makita 5 < 6 mm", normalized);
+        assertFalse(normalized.contains("&amp;"));
+        assertFalse(normalized.contains("&lt;"));
+        assertTrue(reasons.isEmpty());
+    }
+
+    @Test
     void testValidateAndNormalizeNameTruncatesOnWordBoundaryUnder100Chars() {
         List<String> reasons = new ArrayList<>();
         String longTitle = "Velmi dlouhý název produktu který přesahuje sto znaků a je potřeba ho bezpečně zkrátit na hranici slova aby se nerozbil string v databázi";
@@ -74,6 +86,43 @@ class ProductDataValidatorTest {
 
         assertEquals("Popis vrtačky. Plně funkční.", cleaned);
         assertFalse(cleaned.contains("<p>"));
+    }
+
+    @Test
+    void testValidateAndNormalizeDescriptionPreservesNewlinesAndUnescapesEntities() {
+        List<String> reasons = new ArrayList<>();
+        String descWithNewlinesAndEntities = """
+                Aku vrtačka Bosch & Makita.
+                Kapacita 5 < 6 Ah.
+
+                Plně funkční, včetně nabíječky.
+                """;
+
+        String cleaned = validator.validateAndNormalizeDescription(descWithNewlinesAndEntities, "Fallback", reasons);
+
+        assertEquals("""
+                Aku vrtačka Bosch & Makita.
+                Kapacita 5 < 6 Ah.
+
+                Plně funkční, včetně nabíječky.""", cleaned);
+        assertFalse(cleaned.contains("&amp;"));
+        assertFalse(cleaned.contains("&lt;"));
+        assertTrue(cleaned.contains("\n"));
+        assertTrue(reasons.isEmpty());
+    }
+
+    @Test
+    void testValidateAndNormalizeDescriptionConvertsHtmlBreaksToNewlines() {
+        List<String> reasons = new ArrayList<>();
+        String htmlWithBreaks = "První řádek.<br>Druhý řádek.<br/>Třetí řádek.<p>Čtvrtý odstavec.</p>";
+        String cleaned = validator.validateAndNormalizeDescription(htmlWithBreaks, "Fallback", reasons);
+
+        assertEquals("""
+                První řádek.
+                Druhý řádek.
+                Třetí řádek.
+                Čtvrtý odstavec.""", cleaned);
+        assertTrue(reasons.isEmpty());
     }
 
     @Test

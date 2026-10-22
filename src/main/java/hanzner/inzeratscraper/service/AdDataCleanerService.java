@@ -80,6 +80,9 @@ public class AdDataCleanerService {
         // =========================================================================
         List<String> reviewReasons = new ArrayList<>();
         boolean needsReview = aiResult.priceNeedsReview();
+        if (needsReview) {
+            reviewReasons.add("Cena označená k revizi");
+        }
 
         // 1. name: normalizace, HTML strip, max 100 znaků, unikátnost
         String validatedName = validator.validateAndNormalizeName(aiResult.name(), rawAd.rawTitle(), rawAd.externalId(), reviewReasons);
@@ -90,8 +93,14 @@ public class AdDataCleanerService {
 
         // 2. description: strip HTML, max 1000 znaků na hranici věty
         String validatedDesc = validator.validateAndNormalizeDescription(aiResult.description(), preCleanedDescription, reviewReasons);
-        if (!validatedDesc.equals(aiResult.description())) {
+        String rawAiDesc = aiResult.description() != null
+                ? aiResult.description().replaceAll("\r\n|\r", "\n").trim()
+                : null;
+        if (!validatedDesc.equals(rawAiDesc)) {
             needsReview = true;
+            if (reviewReasons.stream().noneMatch(r -> r.toLowerCase(Locale.ROOT).contains("popis"))) {
+                reviewReasons.add("Popis upraven oproti LLM");
+            }
         }
 
         // 3. price: > 1, max 9_999_999_999.99, porovnání s parseBasicPrice (odchylka > 20 %)
@@ -110,6 +119,9 @@ public class AdDataCleanerService {
         String finalReviewReason = null;
         if (needsReview || !reviewReasons.isEmpty()) {
             needsReview = true;
+            if (reviewReasons.isEmpty()) {
+                reviewReasons.add("Vyžaduje kontrolu");
+            }
             finalReviewReason = validator.buildReviewReason(reviewReasons);
         }
 
@@ -152,7 +164,7 @@ public class AdDataCleanerService {
                - Ponechej všechny podstatné technické detaily, rozměry a stav.
                - Popis MUSÍ mít MAXIMÁLNĚ 1000 znaků!
             3. 'price' (numeric 12, 2 v CZK):
-               - Urči číselnou cenu v CZK. Pokud je v poli 'Surov\u00e1 cena' text (např. 'V textu', 'Dohodou' nebo '1 Kč'), najdi skutečnou cenu v popisu.
+               - Urči číselnou cenu v CZK. Pokud je v poli 'Surovová cena' text (např. 'V textu', 'Dohodou' nebo '1 Kč'), najdi skutečnou cenu v popisu.
                - Pokud cena v textu není, nastav price na null a priceNeedsReview na true.
             4. 'category' (varchar 255):
                - Vyber nejvhodnější kategorii POUZE z tohoto povoleného seznamu: %s

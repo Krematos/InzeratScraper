@@ -2,6 +2,8 @@ package hanzner.inzeratscraper.service;
 
 import lombok.Getter;
 import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.parser.Parser;
 import org.jsoup.safety.Safelist;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -73,7 +75,7 @@ public class ProductDataValidator {
     }
 
     /**
-     * Normalizace a validace názvu: strip řídicích znaků a HTML, max 100 znaků, unikátnost.
+     * Normalizace a validace názvu: strip řídicích znaků a HTML, unescape entit, max 100 znaků, unikátnost.
      */
     public String validateAndNormalizeName(String aiName, String rawTitleFallback, String externalId, List<String> reasons) {
         String base = (aiName != null && !aiName.isBlank()) ? aiName : rawTitleFallback;
@@ -82,7 +84,10 @@ public class ProductDataValidator {
         }
 
         String stripped = CONTROL_AND_EXTRA_WHITESPACE.matcher(base).replaceAll("");
-        stripped = Jsoup.clean(stripped, Safelist.none());
+        Document.OutputSettings settings = new Document.OutputSettings().prettyPrint(false);
+        stripped = Jsoup.clean(stripped, "", Safelist.none(), settings);
+        stripped = Parser.unescapeEntities(stripped, false);
+        stripped = stripped.replace('\r', ' ').replace('\n', ' ');
         stripped = MULTI_WHITESPACE.matcher(stripped).replaceAll(" ").trim();
 
         if (stripped.isBlank()) {
@@ -128,7 +133,7 @@ public class ProductDataValidator {
     }
 
     /**
-     * Očištění a zkrácení popisu: Safelist.none(), max 1000 znaků na hranici věty.
+     * Očištění a zkrácení popisu: zachování odřádkování, Safelist.none(), unescape entit, max 1000 znaků na hranici věty.
      */
     public String validateAndNormalizeDescription(String aiDesc, String preCleanedFallback, List<String> reasons) {
         String base = (aiDesc != null && !aiDesc.isBlank()) ? aiDesc : preCleanedFallback;
@@ -137,8 +142,16 @@ public class ProductDataValidator {
         }
 
         String cleaned = CONTROL_AND_EXTRA_WHITESPACE.matcher(base).replaceAll("");
-        cleaned = Jsoup.clean(cleaned, Safelist.none());
-        cleaned = MULTI_WHITESPACE.matcher(cleaned).replaceAll(" ").trim();
+        cleaned = cleaned.replaceAll("\r\n|\r", "\n");
+        cleaned = cleaned.replaceAll("(?i)<br\\s*/?>", "\n");
+        cleaned = cleaned.replaceAll("(?i)</?p[^>]*>", "\n");
+        Document.OutputSettings settings = new Document.OutputSettings().prettyPrint(false);
+        cleaned = Jsoup.clean(cleaned, "", Safelist.none(), settings);
+        cleaned = Parser.unescapeEntities(cleaned, false);
+        cleaned = MULTI_WHITESPACE.matcher(cleaned).replaceAll(" ");
+        cleaned = cleaned.replaceAll("[ \\t]+\\n", "\n");
+        cleaned = cleaned.replaceAll("\\n{3,}", "\n\n");
+        cleaned = cleaned.trim();
 
         if (codePointLength(cleaned) > MAX_DESCRIPTION_LENGTH) {
             reasons.add("Popis zkrácen na 1000 znaků");
@@ -221,7 +234,7 @@ public class ProductDataValidator {
         }
         int endIndex = text.offsetByCodePoints(0, maxCodePoints);
         String sub = text.substring(0, endIndex);
-        int lastSpace = sub.lastIndexOf(' ');
+        int lastSpace = Math.max(sub.lastIndexOf(' '), Math.max(sub.lastIndexOf('\n'), sub.lastIndexOf('\t')));
         if (lastSpace > maxCodePoints / 2) {
             return sub.substring(0, lastSpace).trim();
         }

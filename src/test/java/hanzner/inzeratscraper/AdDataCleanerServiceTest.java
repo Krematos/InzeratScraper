@@ -1,12 +1,19 @@
 package hanzner.inzeratscraper;
 
+import hanzner.inzeratscraper.dto.CleanedProductDto;
+import hanzner.inzeratscraper.dto.RawAdDto;
 import hanzner.inzeratscraper.service.AdDataCleanerService;
+import hanzner.inzeratscraper.service.AdTextSanitizer;
+import hanzner.inzeratscraper.service.LlmClient;
+import hanzner.inzeratscraper.service.ProductDataValidator;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.ObjectMapper;
 
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -15,6 +22,9 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class AdDataCleanerServiceTest {
 
@@ -78,6 +88,65 @@ class AdDataCleanerServiceTest {
 
         assertEquals("Popis vrtačky. Plně funkční.", cleaned);
         assertFalse(cleaned.contains("<p>"));
+    }
+
+    @Test
+    void testValidateAndNormalizeDescriptionPreservesNewlinesAndUnescapesEntities() {
+        List<String> reasons = new ArrayList<>();
+        String rawDesc = "Bosch & Makita nářadí.\nParametry 5 < 6 mm.\n\nStav výborný.";
+        String cleaned = cleanerService.validateAndNormalizeDescription(rawDesc, "Fallback", reasons);
+
+        assertEquals("Bosch & Makita nářadí.\nParametry 5 < 6 mm.\n\nStav výborný.", cleaned);
+        assertFalse(cleaned.contains("&amp;"));
+        assertFalse(cleaned.contains("&lt;"));
+        assertTrue(reasons.isEmpty());
+    }
+
+    @Test
+    void testCleanWithAiDoesNotTriggerNeedsReviewForDescriptionWithNewlinesAndAmpersand() throws IOException, InterruptedException {
+        ObjectMapper objectMapper = new ObjectMapper();
+        LlmClient mockLlm = mock(LlmClient.class);
+        when(mockLlm.stripMarkdownCodeFences(anyString())).thenAnswer(inv -> inv.getArgument(0));
+
+        String llmJsonResponse = """
+                {
+                  "name": "Aku vrtačka Bosch & Makita",
+                  "description": "Profesionální vrtačka Bosch & Makita.\\nKapacita 5 < 6 Ah.\\n\\nPlně funkční stav.",
+                  "price": 2500.0,
+                  "priceNeedsReview": false,
+                  "category": "Nářadí",
+                  "condition": "USED",
+                  "parameters": {"Značka": "Bosch"}
+                }
+                """;
+        when(mockLlm.callLlmApi(anyString())).thenReturn(llmJsonResponse);
+
+        AdDataCleanerService customService = new AdDataCleanerService(
+                objectMapper,
+                new AdTextSanitizer(),
+                mockLlm,
+                new ProductDataValidator(List.of("Elektronika", "Nářadí", "Ostatní"), "STANDARD")
+        );
+
+        RawAdDto rawAd = new RawAdDto(
+                "BAZOS_99999",
+                "https://naradi.bazos.cz/inzerat/99999/vrtacka.php",
+                "naradi",
+                "Prodám Aku vrtačka Bosch & Makita 18V TOP STAV!",
+                "Profesionální vrtačka Bosch & Makita.\nKapacita 5 < 6 Ah.\nPlně funkční stav.\nCena 2500 Kč.\nTel: 777111222",
+                "2 500 Kč",
+                "Praha",
+                Collections.emptyList()
+        );
+
+        CleanedProductDto cleaned = customService.cleanWithAi(rawAd);
+
+        assertEquals("Aku vrtačka Bosch & Makita", cleaned.name());
+        assertEquals("Profesionální vrtačka Bosch & Makita.\nKapacita 5 < 6 Ah.\n\nPlně funkční stav.", cleaned.description());
+        assertFalse(cleaned.description().contains("&amp;"));
+        assertFalse(cleaned.description().contains("&lt;"));
+        assertFalse(cleaned.needsReview());
+        assertNull(cleaned.reviewReason());
     }
 
     @Test
