@@ -66,6 +66,7 @@ class RemoteEshopSyncServiceTest {
                 new BigDecimal("1500.00"),
                 "STANDARD",
                 false,
+                null,
                 "Nářadí",
                 "USED",
                 Map.of("Značka", "Bosch"),
@@ -96,7 +97,7 @@ class RemoteEshopSyncServiceTest {
         ));
 
         CleanedProductDto dto = new CleanedProductDto(
-                "209172265", "url", "Title", "Desc", BigDecimal.TEN, "STANDARD", false, "Nářadí", "USED", Map.of(), List.of()
+                "209172265", "url", "Title", "Desc", BigDecimal.TEN, "STANDARD", false, null, "Nářadí", "USED", Map.of(), List.of()
         );
 
         assertThrows(RestClientResponseException.class, () -> syncService.pushProductToVps(dto));

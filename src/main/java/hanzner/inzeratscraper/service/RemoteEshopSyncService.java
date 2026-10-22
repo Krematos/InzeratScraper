@@ -47,7 +47,7 @@ public class RemoteEshopSyncService {
                     .toBodilessEntity();
 
             log.info("Produkt {} ('{}') byl úspěšně odeslán do e-shopu.",
-                    cleanedProduct.externalId(), cleanedProduct.cleanTitle());
+                    cleanedProduct.externalId(), cleanedProduct.name());
         } catch (RestClientResponseException e) {
             log.error("Chyba HTTP {} při odesílání produktu {} do e-shopu. Tělo odpovědi: {}",
                     e.getStatusCode().value(), cleanedProduct.externalId(), e.getResponseBodyAsString());

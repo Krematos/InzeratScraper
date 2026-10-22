@@ -11,6 +11,8 @@ import java.util.Map;
  * - price: numeric(12, 2) NOT NULL
  * - vatRate: varchar(20) NOT NULL ('STANDARD', 'REDUCED', 'ZERO')
  * - category: varchar(255) NULL
+ * - needsReview: true, pokud validace nebo cena vyžaduje ruční kontrolu
+ * - reviewReason: důvod přepnutí do revize (max 200 znaků)
  * - externalId, sourceUrl, imageUrls, condition, parameters: doplňková metadata pro integraci a fotky
  */
 public record CleanedProductDto(
@@ -20,22 +22,11 @@ public record CleanedProductDto(
         String description,             // max 1000 znaků, očištěný popis pro e-shop
         BigDecimal price,               // numeric(12, 2)
         String vatRate,                 // STANDARD, REDUCED, ZERO
-        boolean priceNeedsReview,       // true, pokud cena nebyla jasná a vyžaduje kontrolu
+        boolean needsReview,            // true, pokud je potřeba manuální revize
+        String reviewReason,            // důvod kontroly (max 200 znaků)
         String category,                // varchar(255)
         String condition,               // NEW, USED, DAMAGED
         Map<String, String> parameters, // doplňkové parametry
         List<String> imageUrls          // URL fotek pro stažení do e-shopu
 ) {
-    // Pomocné gettery pro zpětnou kompatibilitu, pokud by starší kód volal cleanTitle/cleanDescription
-    public String cleanTitle() {
-        return name();
-    }
-
-    public String cleanDescription() {
-        return description();
-    }
-
-    public String suggestedCategory() {
-        return category();
-    }
 }

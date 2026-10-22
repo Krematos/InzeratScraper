@@ -73,6 +73,9 @@ public class RawScrapedAd {
 
     private boolean priceNeedsReview;
 
+    @Column(length = 255)
+    private String reviewReason;
+
     @Column(columnDefinition = "TEXT")
     private String errorMessage;
 

@@ -96,8 +96,9 @@ public class MigrationOrchestratorService {
             String jsonPayload = objectMapper.writeValueAsString(cleanedDto);
 
             ad.setCleanedPayloadJson(jsonPayload);
-            ad.setPriceNeedsReview(cleanedDto.priceNeedsReview());
-            ad.setStatus(cleanedDto.priceNeedsReview()
+            ad.setPriceNeedsReview(cleanedDto.needsReview());
+            ad.setReviewReason(cleanedDto.reviewReason());
+            ad.setStatus(cleanedDto.needsReview()
                     ? AdProcessingStatus.NEEDS_REVIEW
                     : AdProcessingStatus.CLEANED);
             ad.setErrorMessage(null);
@@ -159,6 +160,14 @@ public class MigrationOrchestratorService {
 
         try {
             CleanedProductDto dto = objectMapper.readValue(ad.getCleanedPayloadJson(), CleanedProductDto.class);
+
+            // Bezpečnostní pojistka: pokud cena chybí nebo je nastavena potřeba revize, NIKDY nesyncovat
+            if (dto.price() == null || dto.needsReview()) {
+                log.warn("Inzerát {} má nevalidní cenu nebo vyžaduje revizi ({}), přeskakuji sync.",
+                        ad.getExternalId(), dto.reviewReason());
+                return false;
+            }
+
             if (dryRun) {
                 log.info("[DRY-RUN] Produkt připravený k odeslání ({}): {}", ad.getExternalId(), ad.getCleanedPayloadJson());
                 return true;
