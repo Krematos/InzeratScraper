@@ -130,10 +130,10 @@ class MigrationOrchestratorServiceTest {
         when(rawScrapedAdRepository.findByStatus(AdProcessingStatus.SCRAPED)).thenReturn(List.of(ad1, ad2));
 
         CleanedProductDto cleaned1 = new CleanedProductDto(
-                "101", ad1.getUrl(), "Vrtačka", "Plně funkční", BigDecimal.valueOf(1500), false, "Nářadí", "USED", Map.of(), List.of()
+                "101", ad1.getUrl(), "Vrtačka", "Plně funkční", new BigDecimal("1500.00"), "STANDARD", false, "Nářadí", "USED", Map.of(), List.of()
         );
         CleanedProductDto cleaned2 = new CleanedProductDto(
-                "102", ad2.getUrl(), "Pila", "Cena dohodou", null, true, "Nářadí", "USED", Map.of(), List.of()
+                "102", ad2.getUrl(), "Pila", "Cena dohodou", null, "STANDARD", true, "Nářadí", "USED", Map.of(), List.of()
         );
 
         when(adDataCleanerService.cleanWithAi(any(RawAdDto.class)))
@@ -200,7 +200,7 @@ class MigrationOrchestratorServiceTest {
     @Test
     void testSyncCleanedAdsToEshopDryRunDoesNotCallVpsOrMutateStatus() {
         CleanedProductDto dto = new CleanedProductDto(
-                "201", "url", "Vrtačka", "Popis", BigDecimal.valueOf(900), false, "Nářadí", "USED", Map.of(), List.of()
+                "201", "url", "Vrtačka", "Popis", new BigDecimal("900.00"), "STANDARD", false, "Nářadí", "USED", Map.of(), List.of()
         );
         RawScrapedAd ad = RawScrapedAd.builder()
                 .externalId("201")
@@ -222,7 +222,7 @@ class MigrationOrchestratorServiceTest {
     @Test
     void testSyncCleanedAdsToEshopRealRunPushesToVpsAndUpdatesStatus() {
         CleanedProductDto dto = new CleanedProductDto(
-                "202", "url", "Vrtačka", "Popis", BigDecimal.valueOf(900), false, "Nářadí", "USED", Map.of(), List.of()
+                "202", "url", "Vrtačka", "Popis", new BigDecimal("900.00"), "STANDARD", false, "Nářadí", "USED", Map.of(), List.of()
         );
         RawScrapedAd ad = RawScrapedAd.builder()
                 .externalId("202")
@@ -244,7 +244,7 @@ class MigrationOrchestratorServiceTest {
     @Test
     void testSyncCleanedAdsToEshopMarksFailedWhenPushThrows() {
         CleanedProductDto dto = new CleanedProductDto(
-                "203", "url", "Vrtačka", "Popis", BigDecimal.valueOf(900), false, "Nářadí", "USED", Map.of(), List.of()
+                "203", "url", "Vrtačka", "Popis", new BigDecimal("900.00"), "STANDARD", false, "Nářadí", "USED", Map.of(), List.of()
         );
         RawScrapedAd ad = RawScrapedAd.builder()
                 .externalId("203")

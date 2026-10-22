@@ -63,7 +63,8 @@ class RemoteEshopSyncServiceTest {
                 "https://stroje.bazos.cz/inzerat/209172265/vrtacka.php",
                 "Vrtačka Bosch",
                 "Plně funkční vrtačka.",
-                BigDecimal.valueOf(1500),
+                new BigDecimal("1500.00"),
+                "STANDARD",
                 false,
                 "Nářadí",
                 "USED",
@@ -95,7 +96,7 @@ class RemoteEshopSyncServiceTest {
         ));
 
         CleanedProductDto dto = new CleanedProductDto(
-                "209172265", "url", "Title", "Desc", BigDecimal.TEN, false, "Nářadí", "USED", Map.of(), List.of()
+                "209172265", "url", "Title", "Desc", BigDecimal.TEN, "STANDARD", false, "Nářadí", "USED", Map.of(), List.of()
         );
 
         assertThrows(RestClientResponseException.class, () -> syncService.pushProductToVps(dto));

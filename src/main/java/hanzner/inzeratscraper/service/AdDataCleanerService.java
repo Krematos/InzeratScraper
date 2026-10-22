@@ -11,6 +11,7 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -31,6 +32,11 @@ public class AdDataCleanerService {
 
     private static final String KEY_CONTENT = "content";
     private static final String DEFAULT_CATEGORY = "Ostatní";
+    private static final String DEFAULT_VAT_RATE = "STANDARD";
+
+    private static final int MAX_NAME_LENGTH = 100;
+    private static final int MAX_DESCRIPTION_LENGTH = 1000;
+    private static final int MAX_CATEGORY_LENGTH = 255;
 
     private final ObjectMapper objectMapper;
     private final HttpClient httpClient;
@@ -63,14 +69,15 @@ public class AdDataCleanerService {
     }
 
     /**
-     * Vnořený record pro surovou JSON odpověď z LLM před obohacením o externalId, sourceUrl a imageUrls.
+     * Vnořený record pro surovou JSON odpověď z LLM odpovídající schématu tabulky `products`.
      */
     public record LlmCleanedResponse(
-            String cleanTitle,
-            String cleanDescription,
+            String name,
+            String description,
             BigDecimal price,
+            String vatRate,
             boolean priceNeedsReview,
-            String suggestedCategory,
+            String category,
             String condition,
             Map<String, String> parameters
     ) {}
@@ -83,7 +90,7 @@ public class AdDataCleanerService {
         if (rawPrice != null && !rawPrice.isBlank()) {
             BigDecimal extractedFromRawPrice = extractValidPriceFromToken(rawPrice);
             if (extractedFromRawPrice != null) {
-                return extractedFromRawPrice;
+                return extractedFromRawPrice.setScale(2, RoundingMode.HALF_UP);
             }
         }
 
@@ -94,7 +101,7 @@ public class AdDataCleanerService {
                 String candidate = matcher.group(1);
                 BigDecimal val = extractValidPriceFromToken(candidate);
                 if (val != null) {
-                    return val;
+                    return val.setScale(2, RoundingMode.HALF_UP);
                 }
             }
         }
@@ -151,7 +158,8 @@ public class AdDataCleanerService {
     }
 
     /**
-     * 3. Pokročilé čištění a strukturování přes LLM (vrací rovnou obohacený CleanedProductDto).
+     * 3. Pokročilé čištění a strukturování přes LLM (vrací rovnou obohacený CleanedProductDto
+     * odpovídající struktuře tabulky `products`).
      */
     public CleanedProductDto cleanWithAi(RawAdDto rawAd, List<String> myEshopCategories) throws IOException, InterruptedException {
         List<String> categoriesToUse = (myEshopCategories == null || myEshopCategories.isEmpty())
@@ -162,22 +170,34 @@ public class AdDataCleanerService {
         BigDecimal deterministicPrice = parseBasicPrice(rawAd.rawPrice(), rawAd.rawDescription());
 
         String prompt = """
-            Jsi datový analytik pro e-shop. Tvým úkolem je převést surový bazarový inzerát na čistý produkt pro e-shop.
+            Jsi datový analytik pro e-shop. Tvým úkolem je převést surový bazarový inzerát na čistý produkt pro e-shop do tabulky 'products'.
             
-            Pravidla:
-            1. Z názvu odstraň slova jako "Prodám", "Nabízím", "TOP STAV", vykřičníky apod.
-            2. Z popisu odstraň bazarový balast (informace o tom, že inzerát platí do smazání, zákazy dobírky, časy kdy volat, telefonní čísla, odkazy na další inzeráty). Zachovej všechny technické detaily, rozměry a stav.
-            3. Urči číselnou cenu v CZK. Pokud je v poli 'Surová cena' text (např. 'V textu', 'Dohodou' nebo '1 Kč'), najdi skutečnou cenu v popisu. Pokud tam není, nastav price na null a priceNeedsReview na true.
-            4. Vyber nejvhodnější kategorii POUZE z tohoto seznamu: %s
-            5. Extrahuj klíčové parametry (značka, rozměry, materiál apod.) do mapy 'parameters'.
+            Pravidla pro cílová pole v databázi e-shopu:
+            1. 'name' (varchar 100, unikátní název produktu):
+               - Z názvu odstraň slova jako "Prodám", "Nabízím", "TOP STAV", vykřičníky apod.
+               - Název MUSÍ být stručný, výstižný a MÍT MAXIMÁLNĚ 100 znaků!
+            2. 'description' (varchar 1000):
+               - Odstraň bazarový balast (informace o platnosti inzerátu, zákazy dobírky, časy kdy volat, telefony, e-maily, odkazy na další inzeráty).
+               - Ponechej všechny podstatné technické detaily, rozměry a stav.
+               - Popis MUSÍ mít MAXIMÁLNĚ 1000 znaků!
+            3. 'price' (numeric 12, 2 v CZK):
+               - Urči číselnou cenu v CZK. Pokud je v poli 'Surová cena' text (např. 'V textu', 'Dohodou' nebo '1 Kč'), najdi skutečnou cenu v popisu.
+               - Pokud cena v textu není, nastav price na null a priceNeedsReview na true.
+            4. 'vatRate' (varchar 20, povolené hodnoty: 'STANDARD', 'REDUCED', 'ZERO'):
+               - Pro běžné spotřební zboží nastav 'STANDARD' (21 % DPH).
+            5. 'category' (varchar 255):
+               - Vyber nejvhodnější kategorii POUZE z tohoto povoleného seznamu: %s
+            6. 'condition' ('NEW' | 'USED' | 'DAMAGED').
+            7. 'parameters': mapa klíč-hodnota pro parametry (značka, model apod.).
             
             Vrať POUZE validní JSON odpovídající struktuře:
             {
-              "cleanTitle": "string",
-              "cleanDescription": "string",
+              "name": "string (max 100 znaků)",
+              "description": "string (max 1000 znaků)",
               "price": number nebo null,
+              "vatRate": "STANDARD" | "REDUCED" | "ZERO",
               "priceNeedsReview": boolean,
-              "suggestedCategory": "string",
+              "category": "string",
               "condition": "NEW" | "USED" | "DAMAGED",
               "parameters": {"klic": "hodnota"}
             }
@@ -198,7 +218,7 @@ public class AdDataCleanerService {
         String jsonResponseFromAi = stripMarkdownCodeFences(callLlmApi(prompt));
         LlmCleanedResponse aiResult = objectMapper.readValue(jsonResponseFromAi, LlmCleanedResponse.class);
 
-        // Post-validace ceny:
+        // Post-validace a normalizace ceny (numeric(12, 2)):
         BigDecimal finalPrice = aiResult.price();
         boolean finalNeedsReview = aiResult.priceNeedsReview();
 
@@ -210,18 +230,30 @@ public class AdDataCleanerService {
                 finalNeedsReview = true;
             }
         }
+        if (finalPrice != null) {
+            finalPrice = finalPrice.setScale(2, RoundingMode.HALF_UP);
+        }
 
-        String finalTitle = (aiResult.cleanTitle() != null && !aiResult.cleanTitle().isBlank())
-                ? aiResult.cleanTitle().trim()
+        // Normalizace a ořezání polí podle limitů tabulky products:
+        String rawFinalName = (aiResult.name() != null && !aiResult.name().isBlank())
+                ? aiResult.name().trim()
                 : rawAd.rawTitle();
-        String finalDesc = (aiResult.cleanDescription() != null && !aiResult.cleanDescription().isBlank())
-                ? aiResult.cleanDescription().trim()
+        String finalName = truncateSafely(rawFinalName, MAX_NAME_LENGTH);
+
+        String rawFinalDesc = (aiResult.description() != null && !aiResult.description().isBlank())
+                ? aiResult.description().trim()
                 : preCleanedDescription;
-        String finalCategory = (aiResult.suggestedCategory() != null && !aiResult.suggestedCategory().isBlank())
-                ? aiResult.suggestedCategory().trim()
+        String finalDescription = truncateSafely(rawFinalDesc, MAX_DESCRIPTION_LENGTH);
+
+        String rawCategory = (aiResult.category() != null && !aiResult.category().isBlank())
+                ? aiResult.category().trim()
                 : categoriesToUse.getFirst();
+        String finalCategory = truncateSafely(rawCategory, MAX_CATEGORY_LENGTH);
+
+        String finalVatRate = validateVatRate(aiResult.vatRate());
+
         String finalCondition = (aiResult.condition() != null && !aiResult.condition().isBlank())
-                ? aiResult.condition().trim()
+                ? aiResult.condition().trim().toUpperCase(Locale.ROOT)
                 : "USED";
         Map<String, String> finalParams = aiResult.parameters() != null
                 ? aiResult.parameters()
@@ -233,15 +265,38 @@ public class AdDataCleanerService {
         return new CleanedProductDto(
                 rawAd.externalId(),
                 rawAd.url(),
-                finalTitle,
-                finalDesc,
+                finalName,
+                finalDescription,
                 finalPrice,
+                finalVatRate,
                 finalNeedsReview,
                 finalCategory,
                 finalCondition,
                 finalParams,
                 finalImages
         );
+    }
+
+    private String validateVatRate(String vatRate) {
+        if (vatRate == null || vatRate.isBlank()) {
+            return DEFAULT_VAT_RATE;
+        }
+        String upper = vatRate.trim().toUpperCase(Locale.ROOT);
+        return switch (upper) {
+            case "STANDARD", "REDUCED", "ZERO" -> upper;
+            default -> DEFAULT_VAT_RATE;
+        };
+    }
+
+    private String truncateSafely(String value, int maxLength) {
+        if (value == null) {
+            return "";
+        }
+        String trimmed = value.trim();
+        if (trimmed.length() <= maxLength) {
+            return trimmed;
+        }
+        return trimmed.substring(0, maxLength).trim();
     }
 
     /**

@@ -24,13 +24,13 @@ class AdDataCleanerServiceTest {
     @Test
     void testParseBasicPriceDirectValueWithSpaces() {
         BigDecimal price = cleanerService.parseBasicPrice("1 500 Kč", "Prodám vrtačku.");
-        assertEquals(BigDecimal.valueOf(1500), price);
+        assertEquals(new BigDecimal("1500.00"), price);
     }
 
     @Test
     void testParseBasicPriceSymbolicOneCrownFallbackToDescription() {
         BigDecimal price = cleanerService.parseBasicPrice("1 Kč", "Prodám pilu, plně funkční. Cena v textu: 2500,-");
-        assertEquals(BigDecimal.valueOf(2500), price);
+        assertEquals(new BigDecimal("2500.00"), price);
     }
 
     @Test
@@ -73,9 +73,9 @@ class AdDataCleanerServiceTest {
     void testStripMarkdownCodeFences() {
         String wrapped = """
                 ```json
-                {"cleanTitle": "Bosch GSR 18V"}
+                {"name": "Bosch GSR 18V"}
                 ```
                 """;
-        assertEquals("{\"cleanTitle\": \"Bosch GSR 18V\"}", cleanerService.stripMarkdownCodeFences(wrapped));
+        assertEquals("{\"name\": \"Bosch GSR 18V\"}", cleanerService.stripMarkdownCodeFences(wrapped));
     }
 }
