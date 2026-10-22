@@ -4,6 +4,7 @@ import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.beans.factory.BeanInitializationException;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -39,25 +40,29 @@ public class SecurityConfig {
     }
 
     @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
-        http
-                .csrf(AbstractHttpConfigurer::disable)
-                .httpBasic(AbstractHttpConfigurer::disable)
-                .formLogin(AbstractHttpConfigurer::disable)
-                .headers(headers -> headers.frameOptions(HeadersConfigurer.FrameOptionsConfig::sameOrigin))
-                .addFilterBefore(apiKeyOrLoopbackFilter(), UsernamePasswordAuthenticationFilter.class)
-                .authorizeHttpRequests(auth -> {
-                    if (h2ConsoleEnabled) {
-                        auth.requestMatchers("/h2-console/**").access((authentication, context) ->
-                                new AuthorizationDecision(isLoopbackRequest(context.getRequest())));
-                    } else {
-                        auth.requestMatchers("/h2-console/**").denyAll();
-                    }
-                    auth.requestMatchers("/api/migration/**").access((authentication, context) ->
-                            new AuthorizationDecision(isAuthorizedMigrationRequest(context.getRequest())));
-                    auth.anyRequest().denyAll();
-                });
-        return http.build();
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) {
+        try {
+            http
+                    .csrf(AbstractHttpConfigurer::disable)
+                    .httpBasic(AbstractHttpConfigurer::disable)
+                    .formLogin(AbstractHttpConfigurer::disable)
+                    .headers(headers -> headers.frameOptions(HeadersConfigurer.FrameOptionsConfig::sameOrigin))
+                    .addFilterBefore(apiKeyOrLoopbackFilter(), UsernamePasswordAuthenticationFilter.class)
+                    .authorizeHttpRequests(auth -> {
+                        if (h2ConsoleEnabled) {
+                            auth.requestMatchers("/h2-console/**").access((authentication, context) ->
+                                    new AuthorizationDecision(isLoopbackRequest(context.getRequest())));
+                        } else {
+                            auth.requestMatchers("/h2-console/**").denyAll();
+                        }
+                        auth.requestMatchers("/api/migration/**").access((authentication, context) ->
+                                new AuthorizationDecision(isAuthorizedMigrationRequest(context.getRequest())));
+                        auth.anyRequest().denyAll();
+                    });
+            return http.build();
+        } catch (Exception e) {
+            throw new BeanInitializationException("Chyba při inicializaci SecurityFilterChain", e);
+        }
     }
 
     private OncePerRequestFilter apiKeyOrLoopbackFilter() {
@@ -81,7 +86,7 @@ public class SecurityConfig {
     }
 
     public boolean isAuthorizedMigrationRequest(HttpServletRequest request) {
-        // Pokud je nastaven migration.api.key, vyžadujeme platnou hlavičku X-API-Key
+        // Pokud je nastaven migration.api.key, vyžaduje platnou hlavičku X-API-Key
         if (!migrationApiKey.isEmpty()) {
             String providedKey = request.getHeader(HEADER_API_KEY);
             if (providedKey == null || providedKey.isBlank()) {
@@ -92,7 +97,7 @@ public class SecurityConfig {
                     providedKey.trim().getBytes(StandardCharsets.UTF_8)
             );
         }
-        // Jinak povolíme přístup výhradně z loopback rozhraní (127.0.0.1 / ::1)
+        // Jinak povolí přístup výhradně z loopback rozhraní (127.0.0.1 / ::1)
         return isLoopbackRequest(request);
     }
 

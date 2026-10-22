@@ -25,6 +25,9 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
+      - name: Make mvnw executable
+        run: chmod +x ./mvnw
+
       - name: Build and test with Maven
         run: ./mvnw --batch-mode --no-transfer-progress clean verify
 
