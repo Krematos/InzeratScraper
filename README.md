@@ -56,7 +56,7 @@ Aplikace se konfiguruje v souboru `src/main/resources/application.properties` ne
 
 | Proměnná prostředí | Výchozí hodnota | Popis |
 |--------------------|-----------------|-------|
-| `LLM_API_URL` | Gemini 2.5 Flash endpoint | URL adresa LLM API (Google Gemini / OpenAI kompatibilní) |
+| `LLM_API_URL` | Gemini 3.8 Flash endpoint | URL adresa LLM API (Google Gemini / OpenAI kompatibilní) |
 | `LLM_API_KEY` | *(prázdné)* | API klíč k LLM modelu |
 | `ESHOP_REMOTE_URL` | `http://localhost:8080` | Kořenová URL adresa cílového e-shopu |
 | `ESHOP_REMOTE_API_KEY` | *(prázdné)* | Autentizační klíč e-shopu (`X-API-Key`) |
@@ -75,13 +75,16 @@ Aplikace se konfiguruje v souboru `src/main/resources/application.properties` ne
 ```bash
 ./mvnw clean verify
 # na Windows:
-mvnw.cmd clean verify
+.\mvnw.cmd clean verify
 ```
 
 ### Spuštění aplikace
-```bash
-./mvnw spring-boot:run
-# s profilem local:
+V PowerShellu na Windows je nutné argumenty začínající na `-D` obalit do uvozovek, aby je PowerShell nerozdělil:
+```powershell
+# PowerShell (Windows):
+.\mvnw.cmd spring-boot:run "-Dspring-boot.run.profiles=local"
+
+# Bash (Linux / macOS):
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=local
 ```
 Aplikace naslouchá na `http://127.0.0.1:8080`.
@@ -99,7 +102,7 @@ POST /api/migration/scrape?profileUrl=https://www.bazos.cz/hodnoceni.php?idmail=
 ```
 
 ### 2. Dávkové vyčištění přes AI
-Vezme inzeráty ve stavu `SCRAPED`, provede LLM analýzu a kódovou validaci.
+Vezme inzeráty ve stavu `SCRAPED` nebo `FAILED`, provede LLM analýzu a kódovou validaci.
 ```http
 POST /api/migration/clean?limit=20
 ```

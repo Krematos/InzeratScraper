@@ -36,6 +36,7 @@ public class ProductDataValidator {
 
     private static final Pattern CONTROL_AND_EXTRA_WHITESPACE = Pattern.compile("[\\p{Cntrl}&&[^\\r\\n\\t]]");
     private static final Pattern MULTI_WHITESPACE = Pattern.compile("[ \\t]++");
+    private static final String NEWLINE_PLACEHOLDER = "___NEWLINE_TOKEN___";
 
     @Getter
     private final List<String> defaultCategories;
@@ -145,9 +146,15 @@ public class ProductDataValidator {
         cleaned = cleaned.replaceAll("\r\n|\r", "\n");
         cleaned = cleaned.replaceAll("(?i)<br\\s*/?>", "\n");
         cleaned = cleaned.replaceAll("(?i)</?p[^>]*>", "\n");
+
+        // Fáze 0.1: Zachování zalomení řádků před čištěním Jsoupem pomocí placeholderu
+        cleaned = cleaned.replace("\n", NEWLINE_PLACEHOLDER);
+
         Document.OutputSettings settings = new Document.OutputSettings().prettyPrint(false);
         cleaned = Jsoup.clean(cleaned, "", Safelist.none(), settings);
         cleaned = Parser.unescapeEntities(cleaned, false);
+        cleaned = cleaned.replace(NEWLINE_PLACEHOLDER, "\n");
+
         cleaned = MULTI_WHITESPACE.matcher(cleaned).replaceAll(" ");
         cleaned = cleaned.replaceAll("[ \\t]+\\n", "\n");
         cleaned = cleaned.replaceAll("\\n{3,}", "\n\n");
@@ -161,109 +168,97 @@ public class ProductDataValidator {
     }
 
     /**
-     * Validace ceny: > 1, <= 9_999_999_999.99, porovnání s parseBasicPrice (odchylka > 20 %).
+     * Validace ceny: limit 1 Kč až 9 999 999 999.99 Kč, 2 desetinná místa, porovnání s regex odhadem (max 20 % odchylka).
      */
-    public BigDecimal validatePrice(BigDecimal aiPrice, BigDecimal deterministicPrice, List<String> reasons) {
-        BigDecimal candidate = aiPrice;
-
-        if (candidate == null || candidate.compareTo(MIN_PRICE) <= 0) {
-            if (deterministicPrice != null && deterministicPrice.compareTo(MIN_PRICE) > 0) {
-                candidate = deterministicPrice;
-            } else {
-                reasons.add("Cena nenalezena nebo <= 1 Kč");
-                return null;
-            }
+    public BigDecimal validatePrice(BigDecimal aiPrice, BigDecimal regexPrice, List<String> reasons) {
+        if (aiPrice == null || aiPrice.compareTo(MIN_PRICE) <= 0) {
+            reasons.add("Cena nenalezena nebo <= 1 Kč");
+            return null;
         }
 
-        if (candidate.compareTo(MAX_PRICE) > 0) {
+        if (aiPrice.compareTo(MAX_PRICE) > 0) {
             reasons.add("Cena překračuje limit 9 999 999 999.99");
             return null;
         }
 
-        candidate = candidate.setScale(2, RoundingMode.HALF_UP);
+        BigDecimal scaledPrice = aiPrice.setScale(2, RoundingMode.HALF_UP);
 
-        if (deterministicPrice != null && deterministicPrice.compareTo(MIN_PRICE) > 0) {
-            BigDecimal diff = candidate.subtract(deterministicPrice).abs();
-            BigDecimal threshold = deterministicPrice.multiply(PRICE_DEVIATION_THRESHOLD);
-            if (diff.compareTo(threshold) > 0) {
-                reasons.add(String.format(Locale.ROOT, "Cena AI (%.2f) se liší od regexu (%.2f) o více než 20 %%",
-                        candidate, deterministicPrice));
+        if (regexPrice != null && regexPrice.compareTo(BigDecimal.ZERO) > 0) {
+            BigDecimal diff = scaledPrice.subtract(regexPrice).abs();
+            BigDecimal allowedDiff = regexPrice.multiply(PRICE_DEVIATION_THRESHOLD);
+            if (diff.compareTo(allowedDiff) > 0) {
+                reasons.add("Cena AI se liší od inzerátu o více než 20 % (AI: " + scaledPrice + ", Inzerát: " + regexPrice + ")");
             }
         }
 
-        return candidate;
+        return scaledPrice;
     }
 
     /**
-     * Vyhledání kategorie v allowlistu s návratem kanonického znění.
+     * Mapování kategorie: přesná shoda (case-insensitive) proti allowlistu, jinak fallback na 'Ostatní' + revize.
      */
-    public String resolveCanonicalCategory(String aiCategory, List<String> allowlist, List<String> reasons) {
+    public String resolveCanonicalCategory(String aiCategory, List<String> allowedCategories, List<String> reasons) {
         if (aiCategory != null && !aiCategory.isBlank()) {
-            String trimmed = aiCategory.trim();
-            for (String allowed : allowlist) {
-                if (allowed.equalsIgnoreCase(trimmed)) {
-                    return allowed;
+            String trimmedAi = aiCategory.trim();
+            for (String allowed : allowedCategories) {
+                if (allowed.equalsIgnoreCase(trimmedAi)) {
+                    return allowed; // Zachování přesného zápisu velikosti písmen z allowlistu
                 }
             }
         }
         reasons.add("Kategorie nenalezena v allowlistu");
-        return allowlist.contains(DEFAULT_CATEGORY) ? DEFAULT_CATEGORY : allowlist.getFirst();
+        return allowedCategories.contains(DEFAULT_CATEGORY) ? DEFAULT_CATEGORY : allowedCategories.get(0);
     }
 
     /**
-     * Složení důvodů revize s limitem 200 znaků.
+     * Sestaví souhrnný důvod pro potřebu ruční kontroly (max 200 znaků).
      */
     public String buildReviewReason(List<String> reasons) {
         if (reasons == null || reasons.isEmpty()) {
             return null;
         }
-        String joined = String.join("; ", reasons);
-        if (codePointLength(joined) > MAX_REVIEW_REASON_LENGTH) {
-            return truncateSafely(joined, MAX_REVIEW_REASON_LENGTH);
+        String combined = String.join("; ", reasons);
+        if (codePointLength(combined) > MAX_REVIEW_REASON_LENGTH) {
+            return truncateOnWordBoundary(combined, MAX_REVIEW_REASON_LENGTH);
         }
-        return joined;
+        return combined;
     }
 
     public static int codePointLength(String str) {
         return str != null ? str.codePointCount(0, str.length()) : 0;
     }
 
-    public static String truncateOnWordBoundary(String text, int maxCodePoints) {
-        if (codePointLength(text) <= maxCodePoints) {
-            return text;
+    public static String truncateOnWordBoundary(String str, int maxCodePoints) {
+        if (str == null || codePointLength(str) <= maxCodePoints) {
+            return str;
         }
-        int endIndex = text.offsetByCodePoints(0, maxCodePoints);
-        String sub = text.substring(0, endIndex);
-        int lastSpace = Math.max(sub.lastIndexOf(' '), Math.max(sub.lastIndexOf('\n'), sub.lastIndexOf('\t')));
-        if (lastSpace > maxCodePoints / 2) {
-            return sub.substring(0, lastSpace).trim();
+
+        int targetIndex = str.offsetByCodePoints(0, maxCodePoints);
+        int lastSpace = str.lastIndexOf(' ', targetIndex);
+        if (lastSpace > 0) {
+            return str.substring(0, lastSpace).trim();
         }
-        return sub.trim();
+        return str.substring(0, targetIndex).trim();
     }
 
-    public static String truncateOnSentenceBoundary(String text, int maxCodePoints) {
-        if (codePointLength(text) <= maxCodePoints) {
-            return text;
+    public static String truncateOnSentenceBoundary(String str, int maxCodePoints) {
+        if (str == null || codePointLength(str) <= maxCodePoints) {
+            return str;
         }
-        int endIndex = text.offsetByCodePoints(0, maxCodePoints);
-        String sub = text.substring(0, endIndex);
 
-        int lastPeriod = Math.max(sub.lastIndexOf(". "), Math.max(sub.lastIndexOf(".\n"), sub.lastIndexOf("! ")));
-        if (lastPeriod > maxCodePoints / 2) {
-            return sub.substring(0, lastPeriod + 1).trim();
+        int targetIndex = str.offsetByCodePoints(0, maxCodePoints);
+        int boundary = -1;
+        for (int i = targetIndex - 1; i >= 0; i--) {
+            char c = str.charAt(i);
+            if (c == '.' || c == '!' || c == '?' || c == '\n') {
+                boundary = i + 1;
+                break;
+            }
         }
-        return truncateOnWordBoundary(text, maxCodePoints);
-    }
 
-    private String truncateSafely(String value, int maxCodePoints) {
-        if (value == null) {
-            return "";
+        if (boundary > 0) {
+            return str.substring(0, boundary).trim();
         }
-        String trimmed = value.trim();
-        if (codePointLength(trimmed) <= maxCodePoints) {
-            return trimmed;
-        }
-        int endIndex = trimmed.offsetByCodePoints(0, maxCodePoints);
-        return trimmed.substring(0, endIndex).trim();
+        return truncateOnWordBoundary(str, maxCodePoints);
     }
 }

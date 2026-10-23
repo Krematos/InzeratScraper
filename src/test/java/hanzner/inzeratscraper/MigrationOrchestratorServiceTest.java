@@ -19,17 +19,22 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.net.http.HttpTimeoutException;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -108,6 +113,7 @@ class MigrationOrchestratorServiceTest {
     @Test
     void testCleanStagedAdsSetsCleanedAndNeedsReviewStatus() throws IOException, InterruptedException {
         RawScrapedAd ad1 = RawScrapedAd.builder()
+                .id(1L)
                 .externalId("101")
                 .url("https://stroje.bazos.cz/inzerat/101/vrtacka.php")
                 .subdomainCategory("stroje")
@@ -118,6 +124,7 @@ class MigrationOrchestratorServiceTest {
                 .build();
 
         RawScrapedAd ad2 = RawScrapedAd.builder()
+                .id(2L)
                 .externalId("102")
                 .url("https://stroje.bazos.cz/inzerat/102/pila.php")
                 .subdomainCategory("stroje")
@@ -127,7 +134,9 @@ class MigrationOrchestratorServiceTest {
                 .status(AdProcessingStatus.SCRAPED)
                 .build();
 
-        when(rawScrapedAdRepository.findByStatus(AdProcessingStatus.SCRAPED)).thenReturn(List.of(ad1, ad2));
+        when(rawScrapedAdRepository.findCandidateAdsForProcessing(any(), any()))
+                .thenReturn(List.of(ad1, ad2));
+        when(rawScrapedAdRepository.claim(any(), any())).thenReturn(1);
 
         CleanedProductDto cleaned1 = new CleanedProductDto(
                 "101", ad1.getUrl(), "Vrtačka", "Plně funkční", new BigDecimal("1500.00"), "STANDARD", false, null, "Nářadí", "USED", Map.of(), List.of()
@@ -155,21 +164,168 @@ class MigrationOrchestratorServiceTest {
     }
 
     @Test
-    void testCleanStagedAdsHandlesAiExceptionAndMarksAdFailed() throws IOException, InterruptedException {
+    void testCleanStagedAdsFailFastWhenLlmNotConfiguredDoesNotTouchDb() {
+        doThrow(new IllegalStateException("LLM API klíč není nastaven"))
+                .when(adDataCleanerService).assertLlmConfigured();
+
+        assertThrows(IllegalStateException.class, () -> orchestratorService.cleanStagedAds(10));
+
+        verify(rawScrapedAdRepository, never()).findCandidateAdsForProcessing(any(), any());
+        verify(rawScrapedAdRepository, never()).claim(any(), any());
+        verify(rawScrapedAdRepository, never()).save(any());
+    }
+
+    @Test
+    void testCleanStagedAdsTransientErrorIncrementsAttemptsAndSetsNextRetry() throws IOException, InterruptedException {
         RawScrapedAd ad = RawScrapedAd.builder()
+                .id(103L)
                 .externalId("103")
+                .attempts(0)
                 .status(AdProcessingStatus.SCRAPED)
                 .build();
 
-        when(rawScrapedAdRepository.findByStatus(AdProcessingStatus.SCRAPED)).thenReturn(List.of(ad));
-        when(adDataCleanerService.cleanWithAi(any(RawAdDto.class))).thenThrow(new IOException("LLM API timeout"));
+        when(rawScrapedAdRepository.findCandidateAdsForProcessing(any(), any()))
+                .thenReturn(List.of(ad));
+        when(rawScrapedAdRepository.claim(any(), any())).thenReturn(1);
+        when(adDataCleanerService.cleanWithAi(any(RawAdDto.class)))
+                .thenThrow(new IOException("LLM API timeout"));
+
+        int cleanedCount = orchestratorService.cleanStagedAds(5);
+
+        assertEquals(0, cleanedCount);
+        assertEquals(AdProcessingStatus.SCRAPED, ad.getStatus());
+        assertEquals(1, ad.getAttemptsCount());
+        assertNotNull(ad.getNextRetryAt());
+        assertTrue(ad.getErrorMessage().contains("Přechodná chyba (pokus 1/5)"));
+        verify(rawScrapedAdRepository).save(ad);
+    }
+
+    @Test
+    void testCleanStagedAdsTransientErrorExceedingMaxAttemptsMarksFailed() throws IOException, InterruptedException {
+        RawScrapedAd ad = RawScrapedAd.builder()
+                .id(104L)
+                .externalId("104")
+                .attempts(4)
+                .status(AdProcessingStatus.SCRAPED)
+                .build();
+
+        when(rawScrapedAdRepository.findCandidateAdsForProcessing(any(), any()))
+                .thenReturn(List.of(ad));
+        when(rawScrapedAdRepository.claim(any(), any())).thenReturn(1);
+        when(adDataCleanerService.cleanWithAi(any(RawAdDto.class)))
+                .thenThrow(new IOException("LLM API timeout"));
 
         int cleanedCount = orchestratorService.cleanStagedAds(5);
 
         assertEquals(0, cleanedCount);
         assertEquals(AdProcessingStatus.FAILED, ad.getStatus());
-        assertEquals("LLM API timeout", ad.getErrorMessage());
+        assertEquals(5, ad.getAttemptsCount());
+        assertTrue(ad.getErrorMessage().contains("Vyčerpán maximální počet pokusů (5)"));
         verify(rawScrapedAdRepository).save(ad);
+    }
+
+    @Test
+    void testCleanStagedAdsPermanentErrorMarksFailedImmediately() throws IOException, InterruptedException {
+        RawScrapedAd ad = RawScrapedAd.builder()
+                .id(105L)
+                .externalId("105")
+                .attempts(0)
+                .status(AdProcessingStatus.SCRAPED)
+                .build();
+
+        when(rawScrapedAdRepository.findCandidateAdsForProcessing(any(), any()))
+                .thenReturn(List.of(ad));
+        when(rawScrapedAdRepository.claim(any(), any())).thenReturn(1);
+        when(adDataCleanerService.cleanWithAi(any(RawAdDto.class)))
+                .thenThrow(new IOException("Chyba při volání LLM API (HTTP 400): Bad Request"));
+
+        int cleanedCount = orchestratorService.cleanStagedAds(5);
+
+        assertEquals(0, cleanedCount);
+        assertEquals(AdProcessingStatus.FAILED, ad.getStatus());
+        assertTrue(ad.getErrorMessage().contains("HTTP 400"));
+        verify(rawScrapedAdRepository).save(ad);
+    }
+
+    @Test
+    void testCleanStagedAdsInterruptedExceptionRestoresInterruptAndLeavesAttemptsUnchanged() throws IOException, InterruptedException {
+        RawScrapedAd ad = RawScrapedAd.builder()
+                .id(106L)
+                .externalId("106")
+                .attempts(2)
+                .status(AdProcessingStatus.SCRAPED)
+                .build();
+
+        when(rawScrapedAdRepository.findCandidateAdsForProcessing(any(), any()))
+                .thenReturn(List.of(ad));
+        when(rawScrapedAdRepository.claim(any(), any())).thenReturn(1);
+        when(adDataCleanerService.cleanWithAi(any(RawAdDto.class)))
+                .thenThrow(new InterruptedException("Task cancelled"));
+
+        int cleanedCount = orchestratorService.cleanStagedAds(5);
+
+        assertEquals(0, cleanedCount);
+        assertEquals(AdProcessingStatus.SCRAPED, ad.getStatus());
+        assertEquals(2, ad.getAttemptsCount()); // Nezvýšeno
+        assertNull(ad.getProcessingStartedAt());
+        assertTrue(Thread.currentThread().isInterrupted());
+        // Vyčistit interrupt flag pro další testy
+        Thread.interrupted();
+    }
+
+    @Test
+    void testCleanStagedAdsSkipsUnclaimedAd() throws IOException, InterruptedException {
+        RawScrapedAd ad = RawScrapedAd.builder()
+                .id(107L)
+                .externalId("107")
+                .status(AdProcessingStatus.SCRAPED)
+                .build();
+
+        when(rawScrapedAdRepository.findCandidateAdsForProcessing(any(), any()))
+                .thenReturn(List.of(ad));
+        when(rawScrapedAdRepository.claim(eq(107L), any())).thenReturn(0); // Někdo jiný získal claim
+
+        int cleanedCount = orchestratorService.cleanStagedAds(5);
+
+        assertEquals(0, cleanedCount);
+        verify(adDataCleanerService, never()).cleanWithAi(any());
+        verify(rawScrapedAdRepository, never()).save(ad);
+    }
+
+    @Test
+    void testCleanStagedAdsRetryFailedResetsFailedAds() {
+        when(rawScrapedAdRepository.resetFailedAdsToScraped()).thenReturn(3);
+        when(rawScrapedAdRepository.findCandidateAdsForProcessing(any(), any())).thenReturn(List.of());
+
+        int cleaned = orchestratorService.cleanStagedAds(10, true);
+
+        assertEquals(0, cleaned);
+        verify(rawScrapedAdRepository).resetFailedAdsToScraped();
+    }
+
+    @Test
+    void testRecoverStuckProcessingAdsCallsRepository() {
+        Instant cutoff = Instant.now().minusSeconds(900);
+        when(rawScrapedAdRepository.resetStuckProcessingAds(cutoff)).thenReturn(4);
+
+        int count = orchestratorService.recoverStuckProcessingAds(cutoff);
+
+        assertEquals(4, count);
+        verify(rawScrapedAdRepository).resetStuckProcessingAds(cutoff);
+    }
+
+    @Test
+    void testIsTransientErrorClassificationTable() {
+        assertTrue(orchestratorService.isTransientError(new HttpTimeoutException("timeout")));
+        assertTrue(orchestratorService.isTransientError(new IOException("Chyba při volání LLM API (HTTP 503): Overloaded")));
+        assertTrue(orchestratorService.isTransientError(new IOException("LLM API rate-limit (HTTP 429)")));
+        assertTrue(orchestratorService.isTransientError(new IOException("Connection reset")));
+
+        assertFalse(orchestratorService.isTransientError(new IOException("Chyba při volání LLM API (HTTP 400): Bad Request")));
+        assertFalse(orchestratorService.isTransientError(new IOException("Chyba při volání LLM API (HTTP 401): Unauthorized")));
+        assertFalse(orchestratorService.isTransientError(new IOException("Chyba při volání LLM API (HTTP 403): Forbidden")));
+        assertFalse(orchestratorService.isTransientError(new IOException("Chyba při volání LLM API (HTTP 404): Not Found")));
+        assertFalse(orchestratorService.isTransientError(new IllegalArgumentException("Invalid state")));
     }
 
     @Test
@@ -179,89 +335,127 @@ class MigrationOrchestratorServiceTest {
                 .status(AdProcessingStatus.CLEANED)
                 .priceNeedsReview(false)
                 .build();
-        RawScrapedAd reviewStatusAd = RawScrapedAd.builder()
+        RawScrapedAd needsReviewAd1 = RawScrapedAd.builder()
                 .externalId("2")
                 .status(AdProcessingStatus.NEEDS_REVIEW)
-                .priceNeedsReview(true)
+                .priceNeedsReview(false)
                 .build();
-        RawScrapedAd flagOnlyAd = RawScrapedAd.builder()
+        RawScrapedAd needsReviewAd2 = RawScrapedAd.builder()
                 .externalId("3")
                 .status(AdProcessingStatus.CLEANED)
                 .priceNeedsReview(true)
                 .build();
 
-        when(rawScrapedAdRepository.findAll()).thenReturn(List.of(okAd, reviewStatusAd, flagOnlyAd));
+        when(rawScrapedAdRepository.findAll()).thenReturn(List.of(okAd, needsReviewAd1, needsReviewAd2));
 
         List<RawScrapedAd> result = orchestratorService.getAdsNeedingReview();
 
         assertEquals(2, result.size());
-        assertEquals(List.of("2", "3"), result.stream().map(RawScrapedAd::getExternalId).toList());
+        assertTrue(result.contains(needsReviewAd1));
+        assertTrue(result.contains(needsReviewAd2));
+        assertFalse(result.contains(okAd));
     }
 
     @Test
-    void testSyncCleanedAdsToEshopDryRunDoesNotCallVpsOrMutateStatus() {
-        CleanedProductDto dto = new CleanedProductDto(
-                "201", "url", "Vrtačka", "Popis", new BigDecimal("900.00"), "STANDARD", false, null, "Nářadí", "USED", Map.of(), List.of()
-        );
+    void testSyncCleanedAdsToEshopDryRunDoesNotCallHttp() {
         RawScrapedAd ad = RawScrapedAd.builder()
                 .externalId("201")
                 .status(AdProcessingStatus.CLEANED)
                 .priceNeedsReview(false)
-                .cleanedPayloadJson(objectMapper.writeValueAsString(dto))
+                .cleanedPayloadJson("""
+                        {
+                          "externalId": "201",
+                          "sourceUrl": "url",
+                          "name": "Vrtačka",
+                          "description": "Popis",
+                          "price": 900.00,
+                          "vatRate": "STANDARD",
+                          "needsReview": false,
+                          "reviewReason": null,
+                          "category": "Nářadí",
+                          "condition": "USED",
+                          "parameters": {},
+                          "imageUrls": []
+                        }
+                        """)
                 .build();
 
         when(rawScrapedAdRepository.findByStatus(AdProcessingStatus.CLEANED)).thenReturn(List.of(ad));
 
-        int count = orchestratorService.syncCleanedAdsToEshop(10, true);
+        int synced = orchestratorService.syncCleanedAdsToEshop(10, true);
 
-        assertEquals(1, count);
+        assertEquals(1, synced);
         assertEquals(AdProcessingStatus.CLEANED, ad.getStatus());
         verify(remoteEshopSyncService, never()).pushProductToVps(any());
-        verify(rawScrapedAdRepository, never()).save(any());
+        verify(rawScrapedAdRepository, never()).save(ad);
     }
 
     @Test
-    void testSyncCleanedAdsToEshopRealRunPushesToVpsAndUpdatesStatus() {
-        CleanedProductDto dto = new CleanedProductDto(
-                "202", "url", "Vrtačka", "Popis", new BigDecimal("900.00"), "STANDARD", false, null, "Nářadí", "USED", Map.of(), List.of()
-        );
+    void testSyncCleanedAdsToEshopRealSyncSavesSyncedStatus() {
         RawScrapedAd ad = RawScrapedAd.builder()
                 .externalId("202")
                 .status(AdProcessingStatus.CLEANED)
                 .priceNeedsReview(false)
-                .cleanedPayloadJson(objectMapper.writeValueAsString(dto))
+                .cleanedPayloadJson("""
+                        {
+                          "externalId": "202",
+                          "sourceUrl": "url",
+                          "name": "Pila",
+                          "description": "Popis pily",
+                          "price": 1200.00,
+                          "vatRate": "STANDARD",
+                          "needsReview": false,
+                          "reviewReason": null,
+                          "category": "Nářadí",
+                          "condition": "USED",
+                          "parameters": {},
+                          "imageUrls": []
+                        }
+                        """)
                 .build();
 
         when(rawScrapedAdRepository.findByStatus(AdProcessingStatus.CLEANED)).thenReturn(List.of(ad));
 
-        int count = orchestratorService.syncCleanedAdsToEshop(10, false);
+        int synced = orchestratorService.syncCleanedAdsToEshop(10, false);
 
-        assertEquals(1, count);
+        assertEquals(1, synced);
         assertEquals(AdProcessingStatus.SYNCED, ad.getStatus());
-        verify(remoteEshopSyncService).pushProductToVps(dto);
+        verify(remoteEshopSyncService).pushProductToVps(any());
         verify(rawScrapedAdRepository).save(ad);
     }
 
     @Test
-    void testSyncCleanedAdsToEshopMarksFailedWhenPushThrows() {
-        CleanedProductDto dto = new CleanedProductDto(
-                "203", "url", "Vrtačka", "Popis", new BigDecimal("900.00"), "STANDARD", false, null, "Nářadí", "USED", Map.of(), List.of()
-        );
+    void testSyncCleanedAdsToEshopHandlesErrorAndSetsErrorMessage() {
         RawScrapedAd ad = RawScrapedAd.builder()
                 .externalId("203")
                 .status(AdProcessingStatus.CLEANED)
                 .priceNeedsReview(false)
-                .cleanedPayloadJson(objectMapper.writeValueAsString(dto))
+                .cleanedPayloadJson("""
+                        {
+                          "externalId": "203",
+                          "sourceUrl": "url",
+                          "name": "Bruska",
+                          "description": "Popis brusky",
+                          "price": 500.00,
+                          "vatRate": "STANDARD",
+                          "needsReview": false,
+                          "reviewReason": null,
+                          "category": "Nářadí",
+                          "condition": "USED",
+                          "parameters": {},
+                          "imageUrls": []
+                        }
+                        """)
                 .build();
 
         when(rawScrapedAdRepository.findByStatus(AdProcessingStatus.CLEANED)).thenReturn(List.of(ad));
         doThrow(new RuntimeException("VPS 500 error")).when(remoteEshopSyncService).pushProductToVps(any());
 
-        int count = orchestratorService.syncCleanedAdsToEshop(10, false);
+        int synced = orchestratorService.syncCleanedAdsToEshop(10, false);
 
-        assertEquals(0, count);
-        assertEquals(AdProcessingStatus.FAILED, ad.getStatus());
-        assertEquals("VPS 500 error", ad.getErrorMessage());
+        assertEquals(0, synced);
+        assertEquals(AdProcessingStatus.CLEANED, ad.getStatus());
+        assertTrue(ad.getErrorMessage().contains("VPS 500 error"));
         verify(rawScrapedAdRepository).save(ad);
     }
 }

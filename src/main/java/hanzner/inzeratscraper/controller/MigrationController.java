@@ -39,15 +39,17 @@ public class MigrationController {
 
     /**
      * Fáze 2: Vyčištění surových inzerátů ve stavu SCRAPED přes AI.
-     * Příklad: POST /api/migration/clean?limit=15
+     * Příklad: POST /api/migration/clean?limit=15&retryFailed=false
      */
     @PostMapping("/clean")
     public ResponseEntity<Map<String, Object>> cleanStagedAds(
-            @RequestParam(defaultValue = "15") int limit) {
-        int cleanedCount = orchestratorService.cleanStagedAds(limit);
+            @RequestParam(defaultValue = "15") int limit,
+            @RequestParam(defaultValue = "false") boolean retryFailed) {
+        int cleanedCount = orchestratorService.cleanStagedAds(limit, retryFailed);
         return ResponseEntity.ok(Map.of(
                 "phase", "CLEAN",
                 "limit", limit,
+                "retryFailed", retryFailed,
                 "cleanedCount", cleanedCount
         ));
     }

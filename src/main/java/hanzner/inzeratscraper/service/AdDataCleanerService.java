@@ -2,9 +2,10 @@ package hanzner.inzeratscraper.service;
 
 import hanzner.inzeratscraper.dto.CleanedProductDto;
 import hanzner.inzeratscraper.dto.RawAdDto;
-import lombok.RequiredArgsConstructor;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import tools.jackson.databind.ObjectMapper;
 
@@ -17,15 +18,16 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * Fasáda orchestrující předčištění, LLM analýzu a následnou kódovou validaci inzerátů pro tabulku 'products'.
+ * Zajišťuje čištění surového inzerátu s využitím LLM (Gemini/OpenAI) a následnou
+ * přísnou deterministickou validaci všech polí před uložením do staging DB nebo e-shopu.
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor(onConstructor_ = @Autowired)
 public class AdDataCleanerService {
 
     private final ObjectMapper objectMapper;
     private final AdTextSanitizer textSanitizer;
+    @Getter
     private final LlmClient llmClient;
     private final ProductDataValidator validator;
 
@@ -60,31 +62,46 @@ public class AdDataCleanerService {
         return cleanWithAi(rawAd, validator.getDefaultCategories());
     }
 
-    /**
-     * Vyčistí inzerát pomocí LLM a provede striktní nezávislou validaci v kódu.
-     */
-    public CleanedProductDto cleanWithAi(RawAdDto rawAd, List<String> myEshopCategories) throws IOException, InterruptedException {
-        List<String> categoriesToUse = (myEshopCategories == null || myEshopCategories.isEmpty())
-                ? validator.getDefaultCategories()
-                : myEshopCategories;
+    @Autowired
+    public AdDataCleanerService(
+            ObjectMapper objectMapper,
+            AdTextSanitizer textSanitizer,
+            LlmClient llmClient,
+            ProductDataValidator validator) {
+        this.objectMapper = objectMapper;
+        this.textSanitizer = textSanitizer;
+        this.llmClient = llmClient;
+        this.validator = validator;
+    }
 
-        String preCleanedDescription = textSanitizer.basicRegexCleanDescription(rawAd.rawDescription());
+    /**
+     * Ověří, že LLM klient má nakonfigurován platný API klíč.
+     */
+    public void assertLlmConfigured() {
+        llmClient.assertConfigured();
+    }
+
+    /**
+     * Zavolá LLM pro extrakci dat z inzerátu a aplikuje validaci a sanitizaci.
+     */
+    public CleanedProductDto cleanWithAi(RawAdDto rawAd, List<String> categories) throws IOException, InterruptedException {
+        List<String> categoriesToUse = (categories != null && !categories.isEmpty())
+                ? categories
+                : validator.getDefaultCategories();
+
         BigDecimal deterministicPrice = textSanitizer.parseBasicPrice(rawAd.rawPrice(), rawAd.rawDescription());
+        String preCleanedDescription = textSanitizer.basicRegexCleanDescription(rawAd.rawDescription());
 
         String prompt = buildPrompt(rawAd, preCleanedDescription, categoriesToUse);
-        String jsonResponse = llmClient.stripMarkdownCodeFences(llmClient.callLlmApi(prompt));
-        LlmCleanedResponse aiResult = objectMapper.readValue(jsonResponse, LlmCleanedResponse.class);
+        String rawLlmResponse = llmClient.callLlmApi(prompt);
+        String jsonPayload = llmClient.stripMarkdownCodeFences(rawLlmResponse);
 
-        // =========================================================================
-        // VALIDACE V KÓDU (NEZÁVISLÁ NA LLM)
-        // =========================================================================
+        LlmCleanedResponse aiResult = objectMapper.readValue(jsonPayload, LlmCleanedResponse.class);
+
         List<String> reviewReasons = new ArrayList<>();
         boolean needsReview = aiResult.priceNeedsReview();
-        if (needsReview) {
-            reviewReasons.add("Cena označená k revizi");
-        }
 
-        // 1. name: normalizace, HTML strip, max 100 znaků, unikátnost
+        // 1. name: max 100 znaků, odstranění HTML, garance unikátnosti
         String validatedName = validator.validateAndNormalizeName(aiResult.name(), rawAd.rawTitle(), rawAd.externalId(), reviewReasons);
         if (validatedName.isBlank()) {
             needsReview = true;
@@ -92,11 +109,12 @@ public class AdDataCleanerService {
         }
 
         // 2. description: strip HTML, max 1000 znaků na hranici věty
+        // Fáze 0.3: Porovnání probíhá po stejné normalizaci, aby samotná normalizace nevyvolala falešné NEEDS_REVIEW
         String validatedDesc = validator.validateAndNormalizeDescription(aiResult.description(), preCleanedDescription, reviewReasons);
-        String rawAiDesc = aiResult.description() != null
-                ? aiResult.description().replaceAll("\r\n|\r", "\n").trim()
-                : null;
-        if (!validatedDesc.equals(rawAiDesc)) {
+        String normalizedAiDesc = aiResult.description() != null
+                ? validator.validateAndNormalizeDescription(aiResult.description(), null, new ArrayList<>())
+                : "";
+        if (!validatedDesc.equals(normalizedAiDesc)) {
             needsReview = true;
             if (reviewReasons.stream().noneMatch(r -> r.toLowerCase(Locale.ROOT).contains("popis"))) {
                 reviewReasons.add("Popis upraven oproti LLM");
@@ -164,7 +182,7 @@ public class AdDataCleanerService {
                - Ponechej všechny podstatné technické detaily, rozměry a stav.
                - Popis MUSÍ mít MAXIMÁLNĚ 1000 znaků!
             3. 'price' (numeric 12, 2 v CZK):
-               - Urči číselnou cenu v CZK. Pokud je v poli 'Surovová cena' text (např. 'V textu', 'Dohodou' nebo '1 Kč'), najdi skutečnou cenu v popisu.
+               - Urči číselnou cenu v CZK. Pokud je v poli 'Surová cena' text (např. 'V textu', 'Dohodou' nebo '1 Kč'), najdi skutečnou cenu v popisu.
                - Pokud cena v textu není, nastav price na null a priceNeedsReview na true.
             4. 'category' (varchar 255):
                - Vyber nejvhodnější kategorii POUZE z tohoto povoleného seznamu: %s
@@ -221,12 +239,20 @@ public class AdDataCleanerService {
         return validator.validateAndNormalizeDescription(aiDesc, preCleanedFallback, reasons);
     }
 
-    public BigDecimal validatePrice(BigDecimal aiPrice, BigDecimal deterministicPrice, List<String> reasons) {
-        return validator.validatePrice(aiPrice, deterministicPrice, reasons);
+    public BigDecimal validatePrice(BigDecimal aiPrice, BigDecimal regexPrice, List<String> reasons) {
+        return validator.validatePrice(aiPrice, regexPrice, reasons);
     }
 
-    public String resolveCanonicalCategory(String aiCategory, List<String> allowlist, List<String> reasons) {
-        return validator.resolveCanonicalCategory(aiCategory, allowlist, reasons);
+    public String resolveCanonicalCategory(String aiCategory, List<String> allowedCategories, List<String> reasons) {
+        return validator.resolveCanonicalCategory(aiCategory, allowedCategories, reasons);
+    }
+
+    public String buildReviewReason(List<String> reasons) {
+        return validator.buildReviewReason(reasons);
+    }
+
+    public String getConfiguredVatRate() {
+        return validator.getConfiguredVatRate();
     }
 
     public String stripMarkdownCodeFences(String rawResponse) {

@@ -89,6 +89,17 @@ class ProductDataValidatorTest {
     }
 
     @Test
+    void testValidateAndNormalizeDescriptionPreservesExactNewlinesAndAmpersand() {
+        List<String> reasons = new ArrayList<>();
+        String raw = "Bosch & Makita\n\nDruhý odstavec";
+        String cleaned = validator.validateAndNormalizeDescription(raw, "Fallback", reasons);
+
+        assertEquals("Bosch & Makita\n\nDruhý odstavec", cleaned);
+        assertFalse(cleaned.contains("&amp;"));
+        assertTrue(reasons.isEmpty());
+    }
+
+    @Test
     void testValidateAndNormalizeDescriptionPreservesNewlinesAndUnescapesEntities() {
         List<String> reasons = new ArrayList<>();
         String descWithNewlinesAndEntities = """
@@ -163,5 +174,18 @@ class ProductDataValidatorTest {
 
         assertEquals("Ostatní", validator.resolveCanonicalCategory("Neznámá kategorie", allowlist, reasons));
         assertTrue(reasons.contains("Kategorie nenalezena v allowlistu"));
+    }
+
+    @Test
+    void testBuildReviewReasonTruncatesTo200Chars() {
+        List<String> longReasons = List.of(
+                "Velmi dlouhý první důvod pro ruční kontrolu inzerátu",
+                "Druhý důvod který obsahuje spoustu detailů o nesouladu",
+                "Třetí důvod který definitivně překročí maximální povolenou délku dvě stě znaků v cílovém sloupci review_reason"
+        );
+        String combined = validator.buildReviewReason(longReasons);
+
+        assertNotNull(combined);
+        assertTrue(ProductDataValidator.codePointLength(combined) <= 200);
     }
 }

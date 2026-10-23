@@ -79,19 +79,33 @@ public class RawScrapedAd {
     @Column(columnDefinition = "TEXT")
     private String errorMessage;
 
+    @Builder.Default
+    private Integer attempts = 0;
+
+    private Instant nextRetryAt;
+
+    private Instant processingStartedAt;
+
     private Instant scrapedAt;
 
     private Instant updatedAt;
+
+    public int getAttemptsCount() {
+        return attempts != null ? attempts : 0;
+    }
 
     @PrePersist
     protected void onCreate() {
         Instant now = Instant.now();
         if (this.scrapedAt == null) {
-            this.scrapedAt = Instant.now();
+            this.scrapedAt = now;
         }
         this.updatedAt = now;
         if (this.status == null) {
             this.status = AdProcessingStatus.SCRAPED;
+        }
+        if (this.attempts == null) {
+            this.attempts = 0;
         }
     }
 

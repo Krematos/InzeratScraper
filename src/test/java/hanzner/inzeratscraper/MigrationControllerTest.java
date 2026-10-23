@@ -51,16 +51,32 @@ class MigrationControllerTest {
 
     @Test
     void testCleanStagedAdsEndpoint() {
-        when(orchestratorService.cleanStagedAds(15)).thenReturn(14);
+        when(orchestratorService.cleanStagedAds(15, false)).thenReturn(14);
 
-        ResponseEntity<Map<String, Object>> response = controller.cleanStagedAds(15);
+        ResponseEntity<Map<String, Object>> response = controller.cleanStagedAds(15, false);
 
         assertEquals(HttpStatus.OK, response.getStatusCode());
         assertNotNull(response.getBody());
         assertEquals("CLEAN", response.getBody().get("phase"));
         assertEquals(15, response.getBody().get("limit"));
+        assertEquals(false, response.getBody().get("retryFailed"));
         assertEquals(14, response.getBody().get("cleanedCount"));
-        verify(orchestratorService).cleanStagedAds(15);
+        verify(orchestratorService).cleanStagedAds(15, false);
+    }
+
+    @Test
+    void testCleanStagedAdsEndpointWithRetryFailed() {
+        when(orchestratorService.cleanStagedAds(25, true)).thenReturn(20);
+
+        ResponseEntity<Map<String, Object>> response = controller.cleanStagedAds(25, true);
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        assertNotNull(response.getBody());
+        assertEquals("CLEAN", response.getBody().get("phase"));
+        assertEquals(25, response.getBody().get("limit"));
+        assertEquals(true, response.getBody().get("retryFailed"));
+        assertEquals(20, response.getBody().get("cleanedCount"));
+        verify(orchestratorService).cleanStagedAds(25, true);
     }
 
     @Test
