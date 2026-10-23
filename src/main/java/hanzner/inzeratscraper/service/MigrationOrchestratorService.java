@@ -255,6 +255,9 @@ public class MigrationOrchestratorService {
     }
 
     public boolean isTransientError(Exception e) {
+        if (e instanceof LlmRateLimitException) {
+            return true;
+        }
         if (e instanceof HttpTimeoutException || e instanceof SocketTimeoutException) {
             return true;
         }

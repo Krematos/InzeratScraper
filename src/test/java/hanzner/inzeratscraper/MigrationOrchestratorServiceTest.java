@@ -8,6 +8,7 @@ import hanzner.inzeratscraper.repository.RawScrapedAdRepository;
 import hanzner.inzeratscraper.service.AdDataCleanerService;
 import hanzner.inzeratscraper.service.BazosScraperService;
 import hanzner.inzeratscraper.service.ImageDownloadService;
+import hanzner.inzeratscraper.service.LlmRateLimitException;
 import hanzner.inzeratscraper.service.MigrationOrchestratorService;
 import hanzner.inzeratscraper.service.RemoteEshopSyncService;
 import org.junit.jupiter.api.BeforeEach;
@@ -358,6 +359,7 @@ class MigrationOrchestratorServiceTest {
 
     @Test
     void testIsTransientErrorClassificationTable() {
+        assertTrue(orchestratorService.isTransientError(new LlmRateLimitException("LLM rate limit vyčerpán (HTTP 429)")));
         assertTrue(orchestratorService.isTransientError(new HttpTimeoutException("timeout")));
         assertTrue(orchestratorService.isTransientError(new IOException("Chyba při volání LLM API (HTTP 503): Overloaded")));
         assertTrue(orchestratorService.isTransientError(new IOException("LLM API rate-limit (HTTP 429)")));
