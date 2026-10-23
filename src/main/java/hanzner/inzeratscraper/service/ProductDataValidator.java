@@ -11,14 +11,18 @@ import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.regex.Pattern;
 
 /**
  * Zajišťuje nezávislou validaci v kódu pro cílovou tabulku 'products'.
+ * Zajišťuje atomickou unikátnost názvů bezpečnou pro paralelní zpracování (Fáze 2).
  */
 @Component
 public class ProductDataValidator {
@@ -43,7 +47,7 @@ public class ProductDataValidator {
     @Getter
     private final String configuredVatRate;
 
-    // Sledování použitých názvů pro UNIQUE constraint
+    // Sledování použitých názvů pro UNIQUE constraint (thread-safe ConcurrentHashMap key set)
     private final Set<String> registeredNames = ConcurrentHashMap.newKeySet();
 
     public ProductDataValidator() {
@@ -76,7 +80,35 @@ public class ProductDataValidator {
     }
 
     /**
-     * Normalizace a validace názvu: strip řídicích znaků a HTML, unescape entit, max 100 znaků, unikátnost.
+     * Hromadná registrace známých názvů (např. z DB nebo e-shopu) pro detekci duplicit.
+     */
+    public void registerExistingNames(Collection<String> names) {
+        if (names == null || names.isEmpty()) {
+            return;
+        }
+        for (String name : names) {
+            registerExistingName(name);
+        }
+    }
+
+    /**
+     * Uvolní rezervovaný název (při neúspěšném zpracování inzerátu), aby po opakování nevznikal sufix zbytečně.
+     */
+    public void release(String name) {
+        if (name != null && !name.isBlank()) {
+            registeredNames.remove(name.trim().toLowerCase(Locale.ROOT));
+        }
+    }
+
+    /**
+     * Ověří, zda je název již zaregistrován.
+     */
+    public boolean isNameRegistered(String name) {
+        return name != null && registeredNames.contains(name.trim().toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * Normalizace a validace názvu: strip řídicích znaků a HTML, unescape entit, max 100 znaků, atomická unikátnost.
      */
     public String validateAndNormalizeName(String aiName, String rawTitleFallback, String externalId, List<String> reasons) {
         String base = (aiName != null && !aiName.isBlank()) ? aiName : rawTitleFallback;
@@ -97,24 +129,63 @@ public class ProductDataValidator {
 
         if (codePointLength(stripped) > MAX_NAME_LENGTH) {
             stripped = truncateOnWordBoundary(stripped, MAX_NAME_LENGTH);
-            reasons.add("Název zkrácen na 100 znaků");
+            if (reasons != null) {
+                reasons.add("Název zkrácen na 100 znaků");
+            }
         }
 
-        String uniqueName = ensureNameUniqueness(stripped, externalId);
-        if (!uniqueName.equals(stripped)) {
-            reasons.add("Název upraven pro unikátnost");
-        }
-        registeredNames.add(uniqueName.toLowerCase(Locale.ROOT));
-        return uniqueName;
+        return reserveUniqueName(stripped, externalId, reasons);
     }
 
-    public String ensureNameUniqueness(String baseName, String externalId) {
-        String lowerKey = baseName.toLowerCase(Locale.ROOT);
-        if (!registeredNames.contains(lowerKey)) {
+    /**
+     * Fáze 2.1: Atomická rezervace unikátního názvu přes ConcurrentHashMap.newKeySet().add().
+     * V případě kolize zkouší sufix z externalId, následně čítač a případně hash.
+     * Zaručuje, že výsledný název má vždy délku <= 100 znaků (code points).
+     */
+    public String reserveUniqueName(String baseName, String externalId, List<String> reasons) {
+        if (baseName == null || baseName.isBlank()) {
+            return "";
+        }
+
+        // Pokus 0: základní název bez sufixu přes atomické add
+        if (registeredNames.add(baseName.toLowerCase(Locale.ROOT))) {
             return baseName;
         }
 
-        String suffix = buildSuffix(externalId);
+        if (reasons != null) {
+            reasons.add("Název upraven pro unikátnost");
+        }
+
+        // Pokus 1: sufix z externalId (např. #27164 nebo #100)
+        if (externalId != null && !externalId.isBlank()) {
+            String suffix = buildSuffix(externalId);
+            String candidate = applySuffix(baseName, suffix);
+            if (registeredNames.add(candidate.toLowerCase(Locale.ROOT))) {
+                return candidate;
+            }
+        }
+
+        // Pokus 2..N: čítač nebo hash
+        int counter = 2;
+        while (true) {
+            String suffix = " #" + counter;
+            if (counter > 20) {
+                String hash = Integer.toHexString(ThreadLocalRandom.current().nextInt(0x1000, 0xffff));
+                suffix = " #" + hash;
+            }
+            String candidate = applySuffix(baseName, suffix);
+            if (registeredNames.add(candidate.toLowerCase(Locale.ROOT))) {
+                return candidate;
+            }
+            counter++;
+        }
+    }
+
+    public String ensureNameUniqueness(String baseName, String externalId) {
+        return reserveUniqueName(baseName, externalId, new ArrayList<>());
+    }
+
+    public String applySuffix(String baseName, String suffix) {
         int maxAllowedBase = MAX_NAME_LENGTH - codePointLength(suffix);
         String truncatedBase = codePointLength(baseName) > maxAllowedBase
                 ? truncateOnWordBoundary(baseName, maxAllowedBase)
@@ -129,6 +200,9 @@ public class ProductDataValidator {
         String digitsOnly = externalId.replaceAll("[^0-9]", "");
         if (digitsOnly.length() >= 5) {
             return " #" + digitsOnly.substring(digitsOnly.length() - 5);
+        }
+        if (!digitsOnly.isEmpty()) {
+            return " #" + digitsOnly;
         }
         return " #" + externalId;
     }

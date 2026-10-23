@@ -15,6 +15,7 @@ import org.springframework.context.event.EventListener;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
@@ -112,6 +113,9 @@ public class MigrationOrchestratorService {
         // 1.5 Fail-fast: ověření konfigurace LLM klíče před jakýmkoliv zásahem do DB
         adDataCleanerService.assertLlmConfigured();
 
+        // 2.2 Předvyplnění unikátních názvů z již zpracovaných záznamů (CLEANED, NEEDS_REVIEW, SYNCED)
+        prefillRegisteredNames();
+
         // 1.7 Opakování FAILED záznamů
         if (retryFailed) {
             int resetCount = rawScrapedAdRepository.resetFailedAdsToScraped();
@@ -153,6 +157,29 @@ public class MigrationOrchestratorService {
         return cleanedCount;
     }
 
+    /**
+     * Fáze 2.2: Předvyplní zaregistrované názvy z již zpracovaných záznamů v DB (CLEANED, NEEDS_REVIEW, SYNCED).
+     */
+    public void prefillRegisteredNames() {
+        List<RawScrapedAd> alreadyProcessed = rawScrapedAdRepository.findByStatusIn(
+                List.of(AdProcessingStatus.CLEANED, AdProcessingStatus.NEEDS_REVIEW, AdProcessingStatus.SYNCED)
+        );
+        for (RawScrapedAd ad : alreadyProcessed) {
+            String json = ad.getCleanedPayloadJson();
+            if (json != null && !json.isBlank()) {
+                try {
+                    JsonNode root = objectMapper.readTree(json);
+                    String name = root.path("name").asText(null);
+                    if (name != null && !name.isBlank()) {
+                        adDataCleanerService.registerExistingName(name);
+                    }
+                } catch (Exception e) {
+                    log.warn("Nepodařilo se přečíst název z existujícího payloadu pro inzerát {}: {}", ad.getExternalId(), e.getMessage());
+                }
+            }
+        }
+    }
+
     private boolean cleanSingleStagedAd(RawScrapedAd ad) {
         RawAdDto rawDto = new RawAdDto(
                 ad.getExternalId(),
@@ -165,8 +192,9 @@ public class MigrationOrchestratorService {
                 ad.getRawImages()
         );
 
+        CleanedProductDto cleanedDto = null;
         try {
-            CleanedProductDto cleanedDto = adDataCleanerService.cleanWithAi(rawDto);
+            cleanedDto = adDataCleanerService.cleanWithAi(rawDto);
             String jsonPayload = objectMapper.writeValueAsString(cleanedDto);
 
             ad.setCleanedPayloadJson(jsonPayload);
@@ -180,6 +208,9 @@ public class MigrationOrchestratorService {
             rawScrapedAdRepository.save(ad);
             return true;
         } catch (InterruptedException e) {
+            if (cleanedDto != null) {
+                adDataCleanerService.releaseName(cleanedDto.name());
+            }
             Thread.currentThread().interrupt();
             log.warn("Zpracování inzerátu {} bylo přerušeno (InterruptedException). Vracím do SCRAPED bez zvýšení attempts.",
                     ad.getExternalId());
@@ -189,6 +220,9 @@ public class MigrationOrchestratorService {
             rawScrapedAdRepository.save(ad);
             return false;
         } catch (Exception e) {
+            if (cleanedDto != null) {
+                adDataCleanerService.releaseName(cleanedDto.name());
+            }
             handleProcessingError(ad, e);
             return false;
         }

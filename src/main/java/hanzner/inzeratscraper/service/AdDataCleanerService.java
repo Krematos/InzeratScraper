@@ -12,6 +12,7 @@ import tools.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -101,72 +102,78 @@ public class AdDataCleanerService {
         List<String> reviewReasons = new ArrayList<>();
         boolean needsReview = aiResult.priceNeedsReview();
 
-        // 1. name: max 100 znaků, odstranění HTML, garance unikátnosti
+        // 1. name: max 100 znaků, odstranění HTML, garance atomické unikátnosti
         String validatedName = validator.validateAndNormalizeName(aiResult.name(), rawAd.rawTitle(), rawAd.externalId(), reviewReasons);
         if (validatedName.isBlank()) {
             needsReview = true;
             reviewReasons.add("Název je prázdný");
         }
 
-        // 2. description: strip HTML, max 1000 znaků na hranici věty
-        // Fáze 0.3: Porovnání probíhá po stejné normalizaci, aby samotná normalizace nevyvolala falešné NEEDS_REVIEW
-        String validatedDesc = validator.validateAndNormalizeDescription(aiResult.description(), preCleanedDescription, reviewReasons);
-        String normalizedAiDesc = aiResult.description() != null
-                ? validator.validateAndNormalizeDescription(aiResult.description(), null, new ArrayList<>())
-                : "";
-        if (!validatedDesc.equals(normalizedAiDesc)) {
-            needsReview = true;
-            if (reviewReasons.stream().noneMatch(r -> r.toLowerCase(Locale.ROOT).contains("popis"))) {
-                reviewReasons.add("Popis upraven oproti LLM");
+        try {
+            // 2. description: strip HTML, max 1000 znaků na hranici věty
+            // Fáze 0.3: Porovnání probíhá po stejné normalizaci, aby samotná normalizace nevyvolala falešné NEEDS_REVIEW
+            String validatedDesc = validator.validateAndNormalizeDescription(aiResult.description(), preCleanedDescription, reviewReasons);
+            String normalizedAiDesc = aiResult.description() != null
+                    ? validator.validateAndNormalizeDescription(aiResult.description(), null, new ArrayList<>())
+                    : "";
+            if (!validatedDesc.equals(normalizedAiDesc)) {
+                needsReview = true;
+                if (reviewReasons.stream().noneMatch(r -> r.toLowerCase(Locale.ROOT).contains("popis"))) {
+                    reviewReasons.add("Popis upraven oproti LLM");
+                }
             }
-        }
 
-        // 3. price: > 1, max 9_999_999_999.99, porovnání s parseBasicPrice (odchylka > 20 %)
-        BigDecimal validatedPrice = validator.validatePrice(aiResult.price(), deterministicPrice, reviewReasons);
-        if (validatedPrice == null) {
-            needsReview = true;
-        }
-
-        // 4. category: přesná shoda s allowlistem
-        String validatedCategory = validator.resolveCanonicalCategory(aiResult.category(), categoriesToUse, reviewReasons);
-
-        // 5. vat_rate: bere se z konfigurace
-        String validatedVatRate = validator.getConfiguredVatRate();
-
-        // 6. reviewReason: zkráceno max na 200 znaků
-        String finalReviewReason = null;
-        if (needsReview || !reviewReasons.isEmpty()) {
-            needsReview = true;
-            if (reviewReasons.isEmpty()) {
-                reviewReasons.add("Vyžaduje kontrolu");
+            // 3. price: > 1, max 9_999_999_999.99, porovnání s parseBasicPrice (odchylka > 20 %)
+            BigDecimal validatedPrice = validator.validatePrice(aiResult.price(), deterministicPrice, reviewReasons);
+            if (validatedPrice == null) {
+                needsReview = true;
             }
-            finalReviewReason = validator.buildReviewReason(reviewReasons);
+
+            // 4. category: přesná shoda s allowlistem
+            String validatedCategory = validator.resolveCanonicalCategory(aiResult.category(), categoriesToUse, reviewReasons);
+
+            // 5. vat_rate: bere se z konfigurace
+            String validatedVatRate = validator.getConfiguredVatRate();
+
+            // 6. reviewReason: zkráceno max na 200 znaků
+            String finalReviewReason = null;
+            if (needsReview || !reviewReasons.isEmpty()) {
+                needsReview = true;
+                if (reviewReasons.isEmpty()) {
+                    reviewReasons.add("Vyžaduje kontrolu");
+                }
+                finalReviewReason = validator.buildReviewReason(reviewReasons);
+            }
+
+            String finalCondition = (aiResult.condition() != null && !aiResult.condition().isBlank())
+                    ? aiResult.condition().trim().toUpperCase(Locale.ROOT)
+                    : "USED";
+            Map<String, String> finalParams = aiResult.parameters() != null
+                    ? aiResult.parameters()
+                    : Collections.emptyMap();
+            List<String> finalImages = rawAd.rawImages() != null
+                    ? new ArrayList<>(rawAd.rawImages())
+                    : Collections.emptyList();
+
+            return new CleanedProductDto(
+                    rawAd.externalId(),
+                    rawAd.url(),
+                    validatedName,
+                    validatedDesc,
+                    validatedPrice,
+                    validatedVatRate,
+                    needsReview,
+                    finalReviewReason,
+                    validatedCategory,
+                    finalCondition,
+                    finalParams,
+                    finalImages
+            );
+        } catch (Exception e) {
+            // Fáze 2.3: Při selhání uvolníme rezervovaný název
+            validator.release(validatedName);
+            throw e;
         }
-
-        String finalCondition = (aiResult.condition() != null && !aiResult.condition().isBlank())
-                ? aiResult.condition().trim().toUpperCase(Locale.ROOT)
-                : "USED";
-        Map<String, String> finalParams = aiResult.parameters() != null
-                ? aiResult.parameters()
-                : Collections.emptyMap();
-        List<String> finalImages = rawAd.rawImages() != null
-                ? new ArrayList<>(rawAd.rawImages())
-                : Collections.emptyList();
-
-        return new CleanedProductDto(
-                rawAd.externalId(),
-                rawAd.url(),
-                validatedName,
-                validatedDesc,
-                validatedPrice,
-                validatedVatRate,
-                needsReview,
-                finalReviewReason,
-                validatedCategory,
-                finalCondition,
-                finalParams,
-                finalImages
-        );
     }
 
     private String buildPrompt(RawAdDto rawAd, String preCleanedDesc, List<String> categories) {
@@ -221,6 +228,14 @@ public class AdDataCleanerService {
     // Delegace pro zjednodušení volání v testech i externích místech
     public void registerExistingName(String name) {
         validator.registerExistingName(name);
+    }
+
+    public void registerExistingNames(Collection<String> names) {
+        validator.registerExistingNames(names);
+    }
+
+    public void releaseName(String name) {
+        validator.release(name);
     }
 
     public BigDecimal parseBasicPrice(String rawPrice, String rawDescription) {

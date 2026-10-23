@@ -6,7 +6,13 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -187,5 +193,95 @@ class ProductDataValidatorTest {
 
         assertNotNull(combined);
         assertTrue(ProductDataValidator.codePointLength(combined) <= 200);
+    }
+
+    @Test
+    void testConcurrentNameValidationGuaranteesUniquenessAndMax100Chars() throws InterruptedException, ExecutionException {
+        int threadCount = 50;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        List<Future<String>> futures = new ArrayList<>();
+
+        for (int i = 0; i < threadCount; i++) {
+            final int index = i;
+            futures.add(executor.submit(() -> {
+                List<String> reasons = new ArrayList<>();
+                return validator.validateAndNormalizeName(
+                        "Aku vrtačka Bosch GSR 18V-50 Professional",
+                        "Fallback",
+                        "BAZOS_" + (10000 + index),
+                        reasons
+                );
+            }));
+        }
+
+        List<String> results = new ArrayList<>();
+        for (Future<String> f : futures) {
+            results.add(f.get());
+        }
+        executor.shutdown();
+
+        Set<String> uniqueNames = new HashSet<>(results);
+        assertEquals(threadCount, uniqueNames.size(), "Všech 50 paralelně validovaných názvů musí být unikátních");
+
+        for (String name : results) {
+            assertTrue(ProductDataValidator.codePointLength(name) <= 100,
+                    "Každý název musí mít nejvýše 100 znaků: " + name);
+        }
+    }
+
+    @Test
+    void testConcurrentNameValidationWithLongNameGuaranteesMax100Chars() throws InterruptedException, ExecutionException {
+        int threadCount = 50;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        List<Future<String>> futures = new ArrayList<>();
+        String veryLongName = "Velmi dlouhý název produktu s mnoha detaily pro testování zkracování hranice slov a unikátních sufixů";
+
+        for (int i = 0; i < threadCount; i++) {
+            futures.add(executor.submit(() -> {
+                List<String> reasons = new ArrayList<>();
+                return validator.validateAndNormalizeName(veryLongName, "Fallback", "BAZOS_99999", reasons);
+            }));
+        }
+
+        List<String> results = new ArrayList<>();
+        for (Future<String> f : futures) {
+            results.add(f.get());
+        }
+        executor.shutdown();
+
+        Set<String> uniqueNames = new HashSet<>(results);
+        assertEquals(threadCount, uniqueNames.size(), "Všech 50 výsledků musí být unikátních i při stejném externalId");
+
+        for (String name : results) {
+            assertTrue(ProductDataValidator.codePointLength(name) <= 100,
+                    "Každý název musí mít <= 100 znaků i po přidání sufixu: " + name);
+        }
+    }
+
+    @Test
+    void testReleaseNameAllowsReusingOriginalName() {
+        String name1 = validator.validateAndNormalizeName("Pila Stihl", "Fallback", "BAZOS_100", new ArrayList<>());
+        assertEquals("Pila Stihl", name1);
+
+        String name2 = validator.validateAndNormalizeName("Pila Stihl", "Fallback", "BAZOS_100", new ArrayList<>());
+        assertEquals("Pila Stihl #100", name2);
+
+        // Uvolnění původního názvu
+        validator.release(name1);
+
+        String name3 = validator.validateAndNormalizeName("Pila Stihl", "Fallback", "BAZOS_200", new ArrayList<>());
+        assertEquals("Pila Stihl", name3, "Po uvolnění musí být původní název znovu dostupný bez sufixu");
+    }
+
+    @Test
+    void testRegisterExistingNamesBulk() {
+        validator.registerExistingNames(List.of("Kladivo Fiskars", "Sekera Hultafors"));
+
+        assertTrue(validator.isNameRegistered("Kladivo Fiskars"));
+        assertTrue(validator.isNameRegistered("kladivo fiskars"));
+        assertTrue(validator.isNameRegistered("Sekera Hultafors"));
+
+        String unique = validator.validateAndNormalizeName("Kladivo Fiskars", "Fallback", "BAZOS_12345", new ArrayList<>());
+        assertEquals("Kladivo Fiskars #12345", unique);
     }
 }

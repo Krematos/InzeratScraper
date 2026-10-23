@@ -315,6 +315,48 @@ class MigrationOrchestratorServiceTest {
     }
 
     @Test
+    void testPrefillRegisteredNamesPopulatesExistingNames() {
+        RawScrapedAd ad = RawScrapedAd.builder()
+                .externalId("301")
+                .status(AdProcessingStatus.CLEANED)
+                .cleanedPayloadJson("{\"name\":\"Aku šroubovák DeWalt\"}")
+                .build();
+
+        when(rawScrapedAdRepository.findByStatusIn(any())).thenReturn(List.of(ad));
+
+        orchestratorService.prefillRegisteredNames();
+
+        verify(adDataCleanerService).registerExistingName("Aku šroubovák DeWalt");
+    }
+
+    @Test
+    void testCleanSingleStagedAdReleasesNameOnDatabaseSaveException() throws IOException, InterruptedException {
+        RawScrapedAd ad = RawScrapedAd.builder()
+                .id(401L)
+                .externalId("401")
+                .status(AdProcessingStatus.SCRAPED)
+                .build();
+
+        when(rawScrapedAdRepository.findCandidateAdsForProcessing(any(), any()))
+                .thenReturn(List.of(ad));
+        when(rawScrapedAdRepository.claim(any(), any())).thenReturn(1);
+
+        CleanedProductDto cleaned = new CleanedProductDto(
+                "401", "url", "Aku vrtačka Narex", "Popis", new BigDecimal("1000.00"), "STANDARD", false, null, "Nářadí", "USED", Map.of(), List.of()
+        );
+        when(adDataCleanerService.cleanWithAi(any(RawAdDto.class))).thenReturn(cleaned);
+        // Simulace chyby při ukládání do DB
+        when(rawScrapedAdRepository.save(any(RawScrapedAd.class)))
+                .thenThrow(new RuntimeException("DB disk full"))
+                .thenReturn(ad);
+
+        orchestratorService.cleanStagedAds(5);
+
+        // Ověříme, že při chybě uložení byl název uvolněn
+        verify(adDataCleanerService).releaseName("Aku vrtačka Narex");
+    }
+
+    @Test
     void testIsTransientErrorClassificationTable() {
         assertTrue(orchestratorService.isTransientError(new HttpTimeoutException("timeout")));
         assertTrue(orchestratorService.isTransientError(new IOException("Chyba při volání LLM API (HTTP 503): Overloaded")));
