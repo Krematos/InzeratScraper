@@ -2,7 +2,9 @@ package hanzner.inzeratscraper;
 
 import hanzner.inzeratscraper.controller.MigrationController;
 import hanzner.inzeratscraper.dto.CleanJobDto;
+import hanzner.inzeratscraper.dto.CleanedProductDto;
 import hanzner.inzeratscraper.dto.ReviewItemDto;
+import hanzner.inzeratscraper.entity.AdProcessingStatus;
 import hanzner.inzeratscraper.service.CleanJobService;
 import hanzner.inzeratscraper.service.JobConflictException;
 import hanzner.inzeratscraper.service.MigrationOrchestratorService;
@@ -20,6 +22,7 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -28,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -213,5 +217,56 @@ class MigrationControllerTest {
                 .andExpect(jsonPath("$[0].price").value(1200.00))
                 .andExpect(jsonPath("$[0].reviewReason").value("Nízká cena"))
                 .andExpect(jsonPath("$[0].status").value("NEEDS_REVIEW"));
+    }
+
+    // =========================================================================
+    // Testy pro /stats a /export endpointy
+    // =========================================================================
+
+    @Test
+    @DisplayName("GET /api/migration/stats vrací statistiky všech stavů")
+    void testGetStatusStatsEndpoint() throws Exception {
+        Map<String, Long> stats = new LinkedHashMap<>();
+        stats.put("SCRAPED", 20L);
+        stats.put("PROCESSING", 0L);
+        stats.put("CLEANED", 15L);
+        stats.put("NEEDS_REVIEW", 2L);
+        stats.put("FAILED", 1L);
+        stats.put("SYNCED", 0L);
+
+        when(orchestratorService.getStatusStats()).thenReturn(stats);
+
+        mockMvc.perform(get("/api/migration/stats"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.SCRAPED").value(20))
+                .andExpect(jsonPath("$.CLEANED").value(15))
+                .andExpect(jsonPath("$.NEEDS_REVIEW").value(2))
+                .andExpect(jsonPath("$.FAILED").value(1))
+                .andExpect(jsonPath("$.SYNCED").value(0));
+
+        verify(orchestratorService).getStatusStats();
+    }
+
+    @Test
+    @DisplayName("GET /api/migration/export vrací exportované produkty a předává parametry")
+    void testExportCleanedProductsEndpoint() throws Exception {
+        CleanedProductDto product = new CleanedProductDto(
+                "ext-100", "https://bazos.cz/inzerat/100", "Pila Makita", "Pěkný stav",
+                new BigDecimal("2500.00"), "STANDARD", false, null, "Nářadí", "USED",
+                Map.of(), List.of()
+        );
+
+        when(orchestratorService.exportCleanedProducts(eq(AdProcessingStatus.CLEANED), eq(true)))
+                .thenReturn(List.of(product));
+
+        mockMvc.perform(get("/api/migration/export")
+                        .param("status", "CLEANED")
+                        .param("saveToFile", "true"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].externalId").value("ext-100"))
+                .andExpect(jsonPath("$[0].name").value("Pila Makita"))
+                .andExpect(jsonPath("$[0].price").value(2500.00));
+
+        verify(orchestratorService).exportCleanedProducts(AdProcessingStatus.CLEANED, true);
     }
 }

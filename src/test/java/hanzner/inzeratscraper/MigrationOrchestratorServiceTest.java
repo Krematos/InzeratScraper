@@ -20,9 +20,11 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import tools.jackson.databind.ObjectMapper;
 
+import java.io.File;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.net.http.HttpTimeoutException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -618,5 +620,71 @@ class MigrationOrchestratorServiceTest {
         orchestratorService.onShutdown();
 
         verify(rawScrapedAdRepository).resetStuckProcessingAds(any());
+    }
+
+    // =========================================================================
+    // Testy pro getStatusStats() a exportCleanedProducts()
+    // =========================================================================
+
+    @Test
+    @DisplayName("getStatusStats() vrátí všechny stavy s příslušnými počty z DB")
+    void testGetStatusStats() {
+        List<Object[]> queryResult = List.of(
+                new Object[]{AdProcessingStatus.SCRAPED, 25L},
+                new Object[]{AdProcessingStatus.CLEANED, 10L},
+                new Object[]{AdProcessingStatus.FAILED, 2L}
+        );
+        when(rawScrapedAdRepository.countGroupedByStatus()).thenReturn(queryResult);
+
+        Map<String, Long> stats = orchestratorService.getStatusStats();
+
+        assertNotNull(stats);
+        assertEquals(AdProcessingStatus.values().length, stats.size());
+        assertEquals(25L, stats.get("SCRAPED"));
+        assertEquals(10L, stats.get("CLEANED"));
+        assertEquals(2L, stats.get("FAILED"));
+        assertEquals(0L, stats.get("PROCESSING"));
+        assertEquals(0L, stats.get("NEEDS_REVIEW"));
+        assertEquals(0L, stats.get("SYNCED"));
+    }
+
+    @Test
+    @DisplayName("exportCleanedProducts() vrátí vyčištěné DTO a uloží do souboru, pokud saveToFile=true")
+    void testExportCleanedProductsWithSaveToFile() throws IOException {
+        RawScrapedAd ad = RawScrapedAd.builder()
+                .externalId("exp-1")
+                .status(AdProcessingStatus.CLEANED)
+                .cleanedPayloadJson("""
+                        {
+                          "externalId": "exp-1",
+                          "sourceUrl": "https://bazos.cz/exp-1",
+                          "name": "Kladivo",
+                          "description": "Zánovní",
+                          "price": 200.00,
+                          "vatRate": "STANDARD",
+                          "needsReview": false,
+                          "reviewReason": null,
+                          "category": "Nářadí",
+                          "condition": "USED",
+                          "parameters": {},
+                          "imageUrls": []
+                        }
+                        """)
+                .build();
+
+        when(rawScrapedAdRepository.findByStatus(AdProcessingStatus.CLEANED)).thenReturn(List.of(ad));
+
+        Path exportFile = Path.of("data", "products-export.json");
+        Files.deleteIfExists(exportFile);
+
+        List<CleanedProductDto> result = orchestratorService.exportCleanedProducts(AdProcessingStatus.CLEANED, true);
+
+        assertEquals(1, result.size());
+        assertEquals("exp-1", result.getFirst().externalId());
+        assertEquals("Kladivo", result.getFirst().name());
+        assertTrue(Files.exists(exportFile), "Soubor s exportem měl být vytvořen");
+
+        // Úklid po testu
+        Files.deleteIfExists(exportFile);
     }
 }
