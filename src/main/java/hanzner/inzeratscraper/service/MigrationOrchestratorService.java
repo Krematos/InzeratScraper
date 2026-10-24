@@ -5,10 +5,12 @@ import hanzner.inzeratscraper.dto.RawAdDto;
 import hanzner.inzeratscraper.entity.AdProcessingStatus;
 import hanzner.inzeratscraper.entity.RawScrapedAd;
 import hanzner.inzeratscraper.repository.RawScrapedAdRepository;
+import jakarta.annotation.PreDestroy;
 import lombok.Getter;
-import lombok.RequiredArgsConstructor;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -24,12 +26,17 @@ import java.net.http.HttpTimeoutException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class MigrationOrchestratorService {
 
     private final BazosScraperService bazosScraperService;
@@ -38,6 +45,7 @@ public class MigrationOrchestratorService {
     private final RemoteEshopSyncService remoteEshopSyncService;
     private final RawScrapedAdRepository rawScrapedAdRepository;
     private final ObjectMapper objectMapper;
+    private final ExecutorService llmExecutor;
 
     @Getter
     @Setter
@@ -48,6 +56,36 @@ public class MigrationOrchestratorService {
     @Setter
     @Value("${llm.max-attempts:5}")
     private int maxAttempts = 5;
+
+    @Autowired
+    public MigrationOrchestratorService(
+            BazosScraperService bazosScraperService,
+            ImageDownloadService imageDownloadService,
+            AdDataCleanerService adDataCleanerService,
+            RemoteEshopSyncService remoteEshopSyncService,
+            RawScrapedAdRepository rawScrapedAdRepository,
+            ObjectMapper objectMapper,
+            @Qualifier("llmExecutor") ExecutorService llmExecutor) {
+        this.bazosScraperService = bazosScraperService;
+        this.imageDownloadService = imageDownloadService;
+        this.adDataCleanerService = adDataCleanerService;
+        this.remoteEshopSyncService = remoteEshopSyncService;
+        this.rawScrapedAdRepository = rawScrapedAdRepository;
+        this.objectMapper = objectMapper;
+        this.llmExecutor = llmExecutor != null ? llmExecutor : Executors.newVirtualThreadPerTaskExecutor();
+    }
+
+    public MigrationOrchestratorService(
+            BazosScraperService bazosScraperService,
+            ImageDownloadService imageDownloadService,
+            AdDataCleanerService adDataCleanerService,
+            RemoteEshopSyncService remoteEshopSyncService,
+            RawScrapedAdRepository rawScrapedAdRepository,
+            ObjectMapper objectMapper) {
+        this(bazosScraperService, imageDownloadService, adDataCleanerService,
+                remoteEshopSyncService, rawScrapedAdRepository, objectMapper,
+                Executors.newVirtualThreadPerTaskExecutor());
+    }
 
     /**
      * Fáze 1.4: Obnova po pádu aplikace.
@@ -61,6 +99,22 @@ public class MigrationOrchestratorService {
         if (recovered > 0) {
             log.info("Obnova po pádu: Obnoveno {} zaseknutých záznamů ve stavu PROCESSING starších než {} minut zpět na SCRAPED.",
                     recovered, processingTimeoutMinutes);
+        }
+    }
+
+    /**
+     * Fáze 4.4: Řádné ukončení aplikace.
+     * Vrátí případné rozpracované PROCESSING záznamy zpět do stavu SCRAPED.
+     */
+    @PreDestroy
+    public void onShutdown() {
+        try {
+            int recovered = recoverStuckProcessingAds(Instant.now());
+            if (recovered > 0) {
+                log.info("Řádné ukončení aplikace (@PreDestroy): Vráceno {} rozpracovaných PROCESSING záznamů zpět na SCRAPED.", recovered);
+            }
+        } catch (Exception e) {
+            log.warn("Chyba při obnově PROCESSING záznamů během shutdownu: {}", e.getMessage());
         }
     }
 
@@ -107,7 +161,8 @@ public class MigrationOrchestratorService {
     }
 
     /**
-     * Fáze 2: Vyčistí nezpracované záznamy přes AI s volitelným opakováním FAILED záznamů.
+     * Fáze 2 & 4: Vyčistí nezpracované záznamy paralelně přes AI na virtuálních vláknech
+     * s atomickým claimem a volitelným opakováním FAILED záznamů.
      */
     public int cleanStagedAds(int limit, boolean retryFailed) {
         // 1.5 Fail-fast: ověření konfigurace LLM klíče před jakýmkoliv zásahem do DB
@@ -133,7 +188,9 @@ public class MigrationOrchestratorService {
         log.info("Spouštím Fázi 2 (Čištění přes AI). Nalezeno {} kandidátních SCRAPED záznamů, limit {}.",
                 candidates.size(), effectiveLimit);
 
-        int cleanedCount = 0;
+        List<CompletableFuture<Boolean>> futures = new ArrayList<>();
+        AtomicBoolean interrupted = new AtomicBoolean(false);
+
         for (RawScrapedAd candidate : candidates) {
             // 1.3 Atomický podmíněný claim
             int claimed = (candidate.getId() != null)
@@ -148,7 +205,37 @@ public class MigrationOrchestratorService {
             candidate.setStatus(AdProcessingStatus.PROCESSING);
             candidate.setProcessingStartedAt(Instant.now());
 
-            if (cleanSingleStagedAd(candidate)) {
+            CompletableFuture<Boolean> future = CompletableFuture.supplyAsync(
+                    () -> cleanSingleStagedAd(candidate, interrupted),
+                    llmExecutor
+            );
+            futures.add(future);
+        }
+
+        if (futures.isEmpty()) {
+            log.info("Fáze 2 dokončena. Žádné záznamy nebyly získány k čištění.");
+            return 0;
+        }
+
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Paralelní čištění inzerátů bylo přerušeno: {}", e.getMessage());
+            for (CompletableFuture<Boolean> f : futures) {
+                f.cancel(true);
+            }
+        } catch (ExecutionException e) {
+            log.error("Neočekávaná chyba při paralelním běhu úloh čištění: {}", e.getMessage());
+        }
+
+        if (interrupted.get()) {
+            Thread.currentThread().interrupt();
+        }
+
+        int cleanedCount = 0;
+        for (CompletableFuture<Boolean> f : futures) {
+            if (!f.isCancelled() && !f.isCompletedExceptionally() && Boolean.TRUE.equals(f.getNow(false))) {
                 cleanedCount++;
             }
         }
@@ -180,7 +267,10 @@ public class MigrationOrchestratorService {
         }
     }
 
-    private boolean cleanSingleStagedAd(RawScrapedAd ad) {
+    /**
+     * Zpracuje jeden inzerát. Nesmí být @Transactional, aby se nedrželo DB spojení během volání LLM (Fáze 4.3).
+     */
+    private boolean cleanSingleStagedAd(RawScrapedAd ad, AtomicBoolean interruptedFlag) {
         RawAdDto rawDto = new RawAdDto(
                 ad.getExternalId(),
                 ad.getUrl(),
@@ -208,6 +298,9 @@ public class MigrationOrchestratorService {
             rawScrapedAdRepository.save(ad);
             return true;
         } catch (InterruptedException e) {
+            if (interruptedFlag != null) {
+                interruptedFlag.set(true);
+            }
             if (cleanedDto != null) {
                 adDataCleanerService.releaseName(cleanedDto.name());
             }
@@ -291,8 +384,7 @@ public class MigrationOrchestratorService {
     }
 
     /**
-     * Fáze 3: Odešle vyčištěné záznamy do e-shopu. Při dryRun = true pouze zaloguje payload bez HTTP volání.
-     */
+     * Fáze 3: Odešle vyčištěné záznamy do e-shopu. Při dryRun = true pouze zaloguje payload bez HTTP volání.\n     */
     public int syncCleanedAdsToEshop(int limit, boolean dryRun) {
         int effectiveLimit = limit > 0 ? limit : 50;
         List<RawScrapedAd> cleanedAds = rawScrapedAdRepository.findByStatus(AdProcessingStatus.CLEANED).stream()

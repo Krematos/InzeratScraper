@@ -8,6 +8,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.Collection;
@@ -29,6 +30,7 @@ public interface RawScrapedAdRepository extends JpaRepository<RawScrapedAd, Long
      * Atomický podmíněný claim inzerátu pro bezpečný souběh bez SKIP LOCKED.
      * Vrátí 1 pokud byl záznam úspěšně získán kýmkoliv, 0 pokud ho mezitím získal jiný proces/vlákno.
      */
+    @Transactional
     @Modifying(clearAutomatically = true)
     @Query("update RawScrapedAd a set a.status = hanzner.inzeratscraper.entity.AdProcessingStatus.PROCESSING, a.processingStartedAt = :now " +
            "where a.id = :id and a.status = hanzner.inzeratscraper.entity.AdProcessingStatus.SCRAPED")
@@ -45,6 +47,7 @@ public interface RawScrapedAdRepository extends JpaRepository<RawScrapedAd, Long
     /**
      * Obnova zaseknutých záznamů po pádu aplikace (stav PROCESSING starší než cutoff).
      */
+    @Transactional
     @Modifying(clearAutomatically = true)
     @Query("update RawScrapedAd a set a.status = hanzner.inzeratscraper.entity.AdProcessingStatus.SCRAPED, a.processingStartedAt = null " +
            "where a.status = hanzner.inzeratscraper.entity.AdProcessingStatus.PROCESSING and a.processingStartedAt <= :cutoff")
@@ -53,6 +56,7 @@ public interface RawScrapedAdRepository extends JpaRepository<RawScrapedAd, Long
     /**
      * Opakování FAILED záznamů: resetuje stav na SCRAPED a vynuluje pokusy i chyby.
      */
+    @Transactional
     @Modifying(clearAutomatically = true)
     @Query("update RawScrapedAd a set a.status = hanzner.inzeratscraper.entity.AdProcessingStatus.SCRAPED, a.attempts = 0, a.nextRetryAt = null, a.errorMessage = null " +
            "where a.status = hanzner.inzeratscraper.entity.AdProcessingStatus.FAILED")

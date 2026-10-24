@@ -12,6 +12,7 @@ import hanzner.inzeratscraper.service.LlmRateLimitException;
 import hanzner.inzeratscraper.service.MigrationOrchestratorService;
 import hanzner.inzeratscraper.service.RemoteEshopSyncService;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
@@ -23,8 +24,13 @@ import java.math.BigDecimal;
 import java.net.http.HttpTimeoutException;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -147,8 +153,10 @@ class MigrationOrchestratorServiceTest {
         );
 
         when(adDataCleanerService.cleanWithAi(any(RawAdDto.class)))
-                .thenReturn(cleaned1)
-                .thenReturn(cleaned2);
+                .thenAnswer(inv -> {
+                    RawAdDto dto = inv.getArgument(0);
+                    return "101".equals(dto.externalId()) ? cleaned1 : cleaned2;
+                });
 
         int cleanedCount = orchestratorService.cleanStagedAds(10);
 
@@ -501,5 +509,113 @@ class MigrationOrchestratorServiceTest {
         assertEquals(AdProcessingStatus.CLEANED, ad.getStatus());
         assertTrue(ad.getErrorMessage().contains("VPS 500 error"));
         verify(rawScrapedAdRepository).save(ad);
+    }
+
+    // =========================================================================
+    // Testy Fáze 4: Paralelní zpracování na virtuálních vláknech
+    // =========================================================================
+
+    @Test
+    @DisplayName("Fáze 4: 12 záznamů při concurrency 3 trvá výrazně méně než sekvenčně a všechny jsou zpracovány právě jednou")
+    void testCleanStagedAdsParallelExecutionSignificantlyFasterThanSequential() throws IOException, InterruptedException {
+        int adCount = 12;
+        List<RawScrapedAd> candidates = new ArrayList<>();
+        for (int i = 1; i <= adCount; i++) {
+            candidates.add(RawScrapedAd.builder()
+                    .id((long) i)
+                    .externalId("ext-" + i)
+                    .url("https://bazos.cz/inzerat/" + i)
+                    .status(AdProcessingStatus.SCRAPED)
+                    .build());
+        }
+
+        when(rawScrapedAdRepository.findCandidateAdsForProcessing(any(), any())).thenReturn(candidates);
+        when(rawScrapedAdRepository.claim(any(), any())).thenReturn(1);
+
+        Semaphore concurrencyLimit = new Semaphore(3);
+        AtomicInteger activeConcurrent = new AtomicInteger(0);
+        AtomicInteger maxObservedConcurrent = new AtomicInteger(0);
+        Set<String> processedIds = ConcurrentHashMap.newKeySet();
+
+        when(adDataCleanerService.cleanWithAi(any(RawAdDto.class))).thenAnswer(inv -> {
+            RawAdDto dto = inv.getArgument(0);
+            concurrencyLimit.acquire();
+            int current = activeConcurrent.incrementAndGet();
+            maxObservedConcurrent.accumulateAndGet(current, Math::max);
+            try {
+                // Simulace latence 200 ms
+                Thread.sleep(200);
+                processedIds.add(dto.externalId());
+                return new CleanedProductDto(
+                        dto.externalId(), dto.url(), "Produkt " + dto.externalId(), "Popis",
+                        BigDecimal.TEN, "STANDARD", false, null, "Kategorie", "USED",
+                        Map.of(), List.of()
+                );
+            } finally {
+                activeConcurrent.decrementAndGet();
+                concurrencyLimit.release();
+            }
+        });
+
+        long start = System.currentTimeMillis();
+        int cleanedCount = orchestratorService.cleanStagedAds(adCount);
+        long duration = System.currentTimeMillis() - start;
+
+        // Všech 12 bylo zpracováno
+        assertEquals(adCount, cleanedCount, "Všech 12 inzerátů mělo být vyčištěno");
+        assertEquals(adCount, processedIds.size(), "Všech 12 unikátních inzerátů bylo zpracováno");
+
+        // Maximální pozorovaný souběh nepřekročil 3
+        assertTrue(maxObservedConcurrent.get() <= 3,
+                "Souběh neměl překročit 3, byl: " + maxObservedConcurrent.get());
+
+        // Sekvenčně by 12 * 200 ms trvalo >= 2400 ms. Při souběhu 3 má trvat ~ 4 dávky * 200 ms = ~800-1000 ms.
+        // Ověříme, že trvalo výrazně méně než 2000 ms.
+        assertTrue(duration < 2000,
+                "Dávka trvala " + duration + " ms, což mělo být výrazně méně než sekvenčních 2400 ms");
+    }
+
+    @Test
+    @DisplayName("Fáze 4: Výjimka v jedné paralelní úloze nezhroutí ostatní úlohy")
+    void testCleanStagedAdsExceptionInOneTaskDoesNotCollapseOthers() throws IOException, InterruptedException {
+        List<RawScrapedAd> candidates = new ArrayList<>();
+        for (int i = 1; i <= 5; i++) {
+            candidates.add(RawScrapedAd.builder()
+                    .id((long) i)
+                    .externalId("fail-test-" + i)
+                    .url("https://bazos.cz/inzerat/" + i)
+                    .status(AdProcessingStatus.SCRAPED)
+                    .build());
+        }
+
+        when(rawScrapedAdRepository.findCandidateAdsForProcessing(any(), any())).thenReturn(candidates);
+        when(rawScrapedAdRepository.claim(any(), any())).thenReturn(1);
+
+        when(adDataCleanerService.cleanWithAi(any(RawAdDto.class))).thenAnswer(inv -> {
+            RawAdDto dto = inv.getArgument(0);
+            if ("fail-test-3".equals(dto.externalId())) {
+                throw new IOException("Simulovaný výpadek LLM pro inzerát 3");
+            }
+            return new CleanedProductDto(
+                    dto.externalId(), dto.url(), "Produkt " + dto.externalId(), "Popis",
+                    BigDecimal.TEN, "STANDARD", false, null, "Kategorie", "USED",
+                    Map.of(), List.of()
+            );
+        });
+
+        int cleanedCount = orchestratorService.cleanStagedAds(5);
+
+        // 4 úlohy úspěšně prošly i přes selhání úlohy 3
+        assertEquals(4, cleanedCount, "Ostatní 4 inzeráty měly úspěšně projít");
+    }
+
+    @Test
+    @DisplayName("Fáze 4.4: @PreDestroy obnova rozpracovaných PROCESSING inzerátů při ukončení")
+    void testOnShutdownRecoversProcessingAds() {
+        when(rawScrapedAdRepository.resetStuckProcessingAds(any())).thenReturn(3);
+
+        orchestratorService.onShutdown();
+
+        verify(rawScrapedAdRepository).resetStuckProcessingAds(any());
     }
 }

@@ -65,7 +65,7 @@ public class RawScrapedAd {
     private List<String> rawImages = new ArrayList<>();
 
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false, length = 32)
+    @Column(nullable = false, length = 32, columnDefinition = "varchar(32)")
     private AdProcessingStatus status;
 
     @Column(columnDefinition = "TEXT")
