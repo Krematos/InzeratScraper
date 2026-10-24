@@ -25,11 +25,14 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.net.SocketTimeoutException;
 import java.net.http.HttpTimeoutException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -178,7 +181,8 @@ public class MigrationOrchestratorService {
         // 1.5 Fail-fast: ověření konfigurace LLM klíče před jakýmkoliv zásahem do DB
         adDataCleanerService.assertLlmConfigured();
 
-        // 2.2 Předvyplnění unikátních názvů z již zpracovaných záznamů (CLEANED, NEEDS_REVIEW, SYNCED)\n        prefillRegisteredNames();
+        // 2.2 Předvyplnění unikátních názvů z již zpracovaných záznamů (CLEANED, NEEDS_REVIEW, SYNCED)
+        prefillRegisteredNames();
 
         // 1.7 Opakování FAILED záznamů
         if (retryFailed) {
@@ -309,6 +313,8 @@ public class MigrationOrchestratorService {
             ad.setErrorMessage(null);
             ad.setProcessingStartedAt(null);
             rawScrapedAdRepository.save(ad);
+            log.info("Inzerát {} úspěšně vyčištěn (stav: {}, název: '{}').",
+                    ad.getExternalId(), ad.getStatus(), cleanedDto.name());
             if (progress != null) {
                 progress.onItemCompleted(ad.getStatus());
             }
@@ -428,6 +434,61 @@ public class MigrationOrchestratorService {
                 ad.getReviewReason(),
                 ad.getStatus() != null ? ad.getStatus().name() : null
         );
+    }
+
+    /**
+     * Vrátí přehled počtu inzerátů v jednotlivých fázích / stavech.
+     */
+    public Map<String, Long> getStatusStats() {
+        Map<String, Long> stats = new LinkedHashMap<>();
+        for (AdProcessingStatus status : AdProcessingStatus.values()) {
+            stats.put(status.name(), 0L);
+        }
+        List<Object[]> grouped = rawScrapedAdRepository.countGroupedByStatus();
+        for (Object[] row : grouped) {
+            if (row != null && row.length >= 2 && row[0] instanceof AdProcessingStatus status) {
+                stats.put(status.name(), ((Number) row[1]).longValue());
+            }
+        }
+        return stats;
+    }
+
+    /**
+     * Vrátí vyčištěné produkty připravené pro e-shop ve formě DTO a volitelně je uloží do JSON souboru na disk.
+     */
+    public List<CleanedProductDto> exportCleanedProducts(AdProcessingStatus status, boolean saveToFile) {
+        List<RawScrapedAd> ads = (status != null)
+                ? rawScrapedAdRepository.findByStatus(status)
+                : rawScrapedAdRepository.findByStatusIn(List.of(AdProcessingStatus.CLEANED, AdProcessingStatus.SYNCED));
+
+        List<CleanedProductDto> products = new ArrayList<>();
+        for (RawScrapedAd ad : ads) {
+            String json = ad.getCleanedPayloadJson();
+            if (json != null && !json.isBlank()) {
+                try {
+                    CleanedProductDto dto = objectMapper.readValue(json, CleanedProductDto.class);
+                    products.add(dto);
+                } catch (Exception e) {
+                    log.warn("Chyba při deserializaci vyčištěného produktu pro inzerát {}: {}", ad.getExternalId(), e.getMessage());
+                }
+            }
+        }
+
+        if (saveToFile) {
+            try {
+                Path dataDir = Path.of("./data");
+                if (!Files.exists(dataDir)) {
+                    Files.createDirectories(dataDir);
+                }
+                Path exportFile = dataDir.resolve("products-export.json");
+                objectMapper.writerWithDefaultPrettyPrinter().writeValue(exportFile.toFile(), products);
+                log.info("Závěrečný export {} produktů byl úspěšně uložen do souboru: {}", products.size(), exportFile.toAbsolutePath());
+            } catch (IOException e) {
+                log.error("Nepodařilo se uložit export produktů do souboru: {}", e.getMessage(), e);
+            }
+        }
+
+        return products;
     }
 
     /**

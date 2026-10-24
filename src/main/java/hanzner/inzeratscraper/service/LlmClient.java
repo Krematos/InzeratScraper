@@ -1,5 +1,6 @@
 package hanzner.inzeratscraper.service;
 
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -35,23 +36,27 @@ import java.util.regex.Pattern;
  * Podporuje:
  * - bulkhead (Semaphore) omezující maximální souběžná volání (llm.max-concurrency),
  * - rate limiting (RateLimiter) řídící frekvenci požadavků za minutu (llm.requests-per-minute),
- * - sdílenou pauzu při HTTP 429 (cooldown) respektovanou všemi vlákny na základě Retry-After / exponenciálního backoffu,
+ * - sdílenou pauzu při HTTP 429 (cooldown) respektovanou všemi vlákna na základě Retry-After / exponenciálního backoffu,
  * - typovanou výjimku LlmRateLimitException po vyčerpání pokusů,
  * - bezpečnostní zkracování logů a ochranu API klíčů,
- * - automatický fallback na záložní modely při HTTP 503 a timeoutu.
+ * - automatický fallback na záložní modely při HTTP 503, 504, 404 a timeoutu (výchozí read timeout 15 s).
  */
 @Slf4j
 @Component
+@Getter
 public class LlmClient {
 
     private static final String KEY_CONTENT = "content";
     private static final Pattern MODEL_URL_PATTERN = Pattern.compile("/models/([^:/?]+)");
     private static final int MAX_LOG_BODY_LENGTH = 500;
     private static final int MAX_RETRIES_429 = 3;
+    public static final Duration DEFAULT_READ_TIMEOUT = Duration.ofSeconds(15);
 
+    // Pořadí fallback modelů: gemini-3.5-flash-lite je rychlý, levný a odolný vůči špičkám
     static final List<String> FALLBACK_MODELS = List.of(
-            "gemini-3.8-flash-lite",
             "gemini-3.5-flash-lite",
+            "gemini-3.8-flash-lite",
+            "gemini-3.8-flash",
             "gemini-3.6-flash"
     );
 
@@ -61,14 +66,15 @@ public class LlmClient {
     private final String llmApiUrl;
     private final Semaphore bulkhead;
     private final RateLimiter rateLimiter;
+    private final Duration readTimeout;
     private final LongSupplier nanoTimeSupplier;
     private final Sleeper sleeper;
 
-    // Fáze 3.3: Sdílená pauza při 429 pro všechna vlákna
+    // Sdílená pauza při 429 pro všechna vlákna
     private volatile long cooldownUntilNanos = 0L;
 
     public LlmClient(ObjectMapper objectMapper) {
-        this(objectMapper, "", "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent");
+        this(objectMapper, "", "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent");
     }
 
     public LlmClient(ObjectMapper objectMapper, String llmApiKey, String llmApiUrl) {
@@ -89,7 +95,7 @@ public class LlmClient {
             int maxConcurrency,
             RateLimiter rateLimiter) {
         this(objectMapper, llmApiKey, llmApiUrl, httpClient, maxConcurrency, rateLimiter,
-                System::nanoTime, Thread::sleep);
+                DEFAULT_READ_TIMEOUT, System::nanoTime, Thread::sleep);
     }
 
     public LlmClient(
@@ -103,6 +109,7 @@ public class LlmClient {
             Sleeper sleeper) {
         this(objectMapper, llmApiKey, llmApiUrl, httpClient, maxConcurrency,
                 new RateLimiter(requestsPerMinute, nanoTimeSupplier, sleeper),
+                DEFAULT_READ_TIMEOUT,
                 nanoTimeSupplier, sleeper);
     }
 
@@ -110,12 +117,15 @@ public class LlmClient {
     public LlmClient(
             ObjectMapper objectMapper,
             @Value("${llm.api.key:}") String llmApiKey,
-            @Value("${llm.api.url:https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent}") String llmApiUrl,
+            @Value("${llm.api.url:https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent}") String llmApiUrl,
             @Value("${llm.max-concurrency:3}") int maxConcurrency,
+            @Value("${llm.read-timeout-seconds:15}") int readTimeoutSeconds,
             RateLimiter rateLimiter) {
         this(objectMapper, llmApiKey, llmApiUrl, HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(20))
-                .build(), maxConcurrency, rateLimiter, System::nanoTime, Thread::sleep);
+                .build(), maxConcurrency, rateLimiter,
+                Duration.ofSeconds(readTimeoutSeconds > 0 ? readTimeoutSeconds : 15),
+                System::nanoTime, Thread::sleep);
     }
 
     public LlmClient(
@@ -127,11 +137,27 @@ public class LlmClient {
             RateLimiter rateLimiter,
             LongSupplier nanoTimeSupplier,
             Sleeper sleeper) {
+        this(objectMapper, llmApiKey, llmApiUrl, httpClient, maxConcurrency, rateLimiter,
+                DEFAULT_READ_TIMEOUT, nanoTimeSupplier, sleeper);
+    }
+
+    public LlmClient(
+            ObjectMapper objectMapper,
+            String llmApiKey,
+            String llmApiUrl,
+            HttpClient httpClient,
+            int maxConcurrency,
+            RateLimiter rateLimiter,
+            Duration readTimeout,
+            LongSupplier nanoTimeSupplier,
+            Sleeper sleeper) {
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper nesmí být null");
         this.httpClient = Objects.requireNonNull(httpClient, "httpClient nesmí být null");
         this.llmApiKey = llmApiKey != null ? llmApiKey : "";
         this.llmApiUrl = llmApiUrl != null ? llmApiUrl : "";
         this.bulkhead = new Semaphore(Math.max(1, maxConcurrency), true);
+        this.readTimeout = (readTimeout != null && !readTimeout.isNegative() && !readTimeout.isZero())
+                ? readTimeout : DEFAULT_READ_TIMEOUT;
         this.nanoTimeSupplier = nanoTimeSupplier != null ? nanoTimeSupplier : System::nanoTime;
         this.sleeper = sleeper != null ? sleeper : Thread::sleep;
         this.rateLimiter = rateLimiter != null ? rateLimiter : new RateLimiter(0, this.nanoTimeSupplier, this.sleeper);
@@ -170,12 +196,12 @@ public class LlmClient {
     /**
      * Zavolá LLM API s daným promptem a vrátí neočištěný JSON text.
      * Řízeno přes bulkhead (Semaphore), rate limiter a sdílený cooldown při HTTP 429.
-     * Při HTTP 503 nebo timeoutu přepíná na záložní modely (3.8 flash lite, 3.5 flash lite, 3.6 flash).
+     * Při HTTP 503, 504, 404 nebo timeoutu přepíná na záložní modely.
      */
     public String callLlmApi(String prompt) throws IOException, InterruptedException {
         assertConfigured();
 
-        // Fáze 3.2: Bulkhead omezující maximální souběh volání
+        // Bulkhead omezující maximální souběh volání
         bulkhead.acquire();
         try {
             return doCallLlmApi(prompt);
@@ -196,15 +222,15 @@ public class LlmClient {
             int attempt429 = 0;
 
             while (true) {
-                // Fáze 3.3: Všechna vlákna respektují sdílenou pauzu po HTTP 429
+                // Dodržení sdílené pauzy po HTTP 429
                 awaitCooldownIfActive();
 
-                // Fáze 3.1: Dodržení limitu frekvence požadavků
+                // Dodržení limitu frekvence požadavků
                 rateLimiter.acquire();
 
                 HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
                         .uri(URI.create(currentUrl))
-                        .timeout(Duration.ofSeconds(45))
+                        .timeout(readTimeout)
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString(requestBodyJson));
 
@@ -219,8 +245,8 @@ public class LlmClient {
                     response = httpClient.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofString());
                 } catch (HttpTimeoutException | SocketTimeoutException e) {
                     if (hasNextFallback) {
-                        log.warn("LLM API timeout pro model na URL: {}. Přepínám na další model v pořadí fallbacku: {}",
-                                sanitizeUrl(currentUrl), sanitizeUrl(candidateUrls.get(i + 1)));
+                        log.warn("LLM API timeout ({} s) pro model na URL: {}. Přepínám na další model v pořadí fallbacku: {}",
+                                readTimeout.toSeconds(), sanitizeUrl(currentUrl), sanitizeUrl(candidateUrls.get(i + 1)));
                         lastException = new IOException("LLM API timeout pro URL " + sanitizeUrl(currentUrl) + ": " + e.getMessage(), e);
                         break;
                     } else {
@@ -231,10 +257,13 @@ public class LlmClient {
                 int status = response.statusCode();
 
                 if (status >= 200 && status < 300) {
+                    if (i > 0) {
+                        log.info("Úspěšná odpověď z fallback modelu na URL: {}", sanitizeUrl(currentUrl));
+                    }
                     return extractTextFromLlmResponse(response.body(), isGemini);
                 }
 
-                // Fáze 3.3 a 3.4: Ošetření HTTP 429 rate limitu
+                //  Ošetření HTTP 429 rate limitu
                 if (status == 429) {
                     if (attempt429 < MAX_RETRIES_429) {
                         attempt429++;
@@ -254,7 +283,8 @@ public class LlmClient {
                     }
                 }
 
-                if ((status == 503 || status == 504) && hasNextFallback) {
+                // Fallback při HTTP 503, 504 a 404 (neexistující / nedostupný model)
+                if ((status == 503 || status == 504 || status == 404) && hasNextFallback) {
                     log.warn("LLM API vrátilo HTTP {} pro model na URL: {}. Přepínám na další model v pořadí fallbacku: {}",
                             status, sanitizeUrl(currentUrl), sanitizeUrl(candidateUrls.get(i + 1)));
                     lastException = new IOException("Chyba při volání LLM API (HTTP " + status + "): " +
@@ -321,7 +351,7 @@ public class LlmClient {
     public long calculate429BackoffSeconds(int attempt429) {
         long base = 2L * (1L << Math.min(attempt429 - 1, 5)); // 2s, 4s, 8s...
         long jitter = ThreadLocalRandom.current().nextLong(0, 2); // 0 až 1 s jitter
-        return Math.min(120L, Math.max(1L, base + jitter));
+        return Math.clamp(base + jitter, 1L, 120L);
     }
 
     /**
@@ -397,17 +427,5 @@ public class LlmClient {
             trimmed = trimmed.substring(0, trimmed.length() - 3).trim();
         }
         return trimmed;
-    }
-
-    public long getCooldownUntilNanos() {
-        return cooldownUntilNanos;
-    }
-
-    public Semaphore getBulkhead() {
-        return bulkhead;
-    }
-
-    public RateLimiter getRateLimiter() {
-        return rateLimiter;
     }
 }

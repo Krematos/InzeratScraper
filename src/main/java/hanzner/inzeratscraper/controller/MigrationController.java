@@ -1,7 +1,9 @@
 package hanzner.inzeratscraper.controller;
 
 import hanzner.inzeratscraper.dto.CleanJobDto;
+import hanzner.inzeratscraper.dto.CleanedProductDto;
 import hanzner.inzeratscraper.dto.ReviewItemDto;
+import hanzner.inzeratscraper.entity.AdProcessingStatus;
 import hanzner.inzeratscraper.service.CleanJobService;
 import hanzner.inzeratscraper.service.JobConflictException;
 import hanzner.inzeratscraper.service.MigrationOrchestratorService;
@@ -113,6 +115,27 @@ public class MigrationController {
     @GetMapping("/review")
     public ResponseEntity<List<ReviewItemDto>> getAdsNeedingReview() {
         return ResponseEntity.ok(orchestratorService.getAdsNeedingReview());
+    }
+
+    /**
+     * Přehled počtu inzerátů v jednotlivých fázích / stavech.
+     * Příklad: GET /api/migration/stats
+     */
+    @GetMapping("/stats")
+    public ResponseEntity<Map<String, Long>> getStatusStats() {
+        return ResponseEntity.ok(orchestratorService.getStatusStats());
+    }
+
+    /**
+     * Závěrečný export vyčištěných produktů ve formátu JSON.
+     * Volitelně lze vyfiltrovat specifický stav (např. status=CLEANED) a uložit do souboru ./data/products-export.json.
+     * Příklad: GET /api/migration/export?saveToFile=true&status=CLEANED
+     */
+    @GetMapping("/export")
+    public ResponseEntity<List<CleanedProductDto>> exportCleanedProducts(
+            @RequestParam(required = false) AdProcessingStatus status,
+            @RequestParam(defaultValue = "false") boolean saveToFile) {
+        return ResponseEntity.ok(orchestratorService.exportCleanedProducts(status, saveToFile));
     }
 
     /**

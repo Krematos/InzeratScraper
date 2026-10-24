@@ -27,6 +27,12 @@ public interface RawScrapedAdRepository extends JpaRepository<RawScrapedAd, Long
     List<RawScrapedAd> findByStatusIn(Collection<AdProcessingStatus> statuses);
 
     /**
+     * Vrátí agregovaný počet inzerátů seskupený podle stavu (fáze zpracování).
+     */
+    @Query("select a.status, count(a) from RawScrapedAd a group by a.status")
+    List<Object[]> countGroupedByStatus();
+
+    /**
      * Atomický podmíněný claim inzerátu pro bezpečný souběh bez SKIP LOCKED.
      * Vrátí 1 pokud byl záznam úspěšně získán kýmkoliv, 0 pokud ho mezitím získal jiný proces/vlákno.
      */

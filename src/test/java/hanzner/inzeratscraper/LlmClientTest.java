@@ -13,6 +13,7 @@ import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -73,15 +74,28 @@ class LlmClientTest {
     }
 
     @Test
-    void testCandidateUrlsGeneration() {
+    void testCandidateUrlsGenerationWith38FlashPrimary() {
         LlmClient client = new LlmClient(new ObjectMapper(), "key",
                 "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent");
 
         List<String> urls = client.getCandidateUrls();
         assertEquals(4, urls.size());
         assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent", urls.get(0));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent", urls.get(1));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-lite:generateContent", urls.get(2));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent", urls.get(3));
+    }
+
+    @Test
+    void testCandidateUrlsGenerationWith35FlashLitePrimary() {
+        LlmClient client = new LlmClient(new ObjectMapper(), "key",
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent");
+
+        List<String> urls = client.getCandidateUrls();
+        assertEquals(4, urls.size());
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent", urls.get(0));
         assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-lite:generateContent", urls.get(1));
-        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent", urls.get(2));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent", urls.get(2));
         assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent", urls.get(3));
     }
 
@@ -91,10 +105,11 @@ class LlmClientTest {
                 "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-lite:generateContent");
 
         List<String> urls = client.getCandidateUrls();
-        assertEquals(3, urls.size());
+        assertEquals(4, urls.size());
         assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-lite:generateContent", urls.get(0));
         assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent", urls.get(1));
-        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent", urls.get(2));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent", urls.get(2));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent", urls.get(3));
     }
 
     @Test
@@ -102,6 +117,19 @@ class LlmClientTest {
         LlmClient client = new LlmClient(new ObjectMapper(), "key", "https://api.openai.com/v1/chat/completions");
         List<String> urls = client.getCandidateUrls();
         assertEquals(List.of("https://api.openai.com/v1/chat/completions"), urls);
+    }
+
+    @Test
+    void testReadTimeoutConfiguration() {
+        LlmClient defaultClient = new LlmClient(new ObjectMapper(), "key", "https://api.example.com");
+        assertEquals(Duration.ofSeconds(15), defaultClient.getReadTimeout());
+
+        LlmClient customClient = new LlmClient(
+                new ObjectMapper(), "key", "https://api.example.com",
+                HttpClient.newHttpClient(), 3, new RateLimiter(0),
+                Duration.ofSeconds(20), System::nanoTime, Thread::sleep
+        );
+        assertEquals(Duration.ofSeconds(20), customClient.getReadTimeout());
     }
 
     @Test
@@ -126,6 +154,31 @@ class LlmClientTest {
 
         String result = client.callLlmApi("test prompt");
         assertEquals("{\"name\":\"Test\"}", result);
+        verify(mockHttpClient, times(2)).send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testFallbackOn404SwitchesToNextModel() throws Exception {
+        HttpClient mockHttpClient = mock(HttpClient.class);
+        HttpResponse<String> response404 = mock(HttpResponse.class);
+        when(response404.statusCode()).thenReturn(404);
+        when(response404.body()).thenReturn("{\"error\": \"Model not found\"}");
+
+        HttpResponse<String> response200 = mock(HttpResponse.class);
+        when(response200.statusCode()).thenReturn(200);
+        when(response200.body()).thenReturn("{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"{\\\"name\\\":\\\"FallbackAfter404\\\"}\"}]}}]}");
+
+        when(mockHttpClient.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
+                .thenReturn(response404)
+                .thenReturn(response200);
+
+        LlmClient client = new LlmClient(new ObjectMapper(), "test-key",
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
+                mockHttpClient);
+
+        String result = client.callLlmApi("test prompt");
+        assertEquals("{\"name\":\"FallbackAfter404\"}", result);
         verify(mockHttpClient, times(2)).send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class));
     }
 
