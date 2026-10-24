@@ -81,35 +81,35 @@ class LlmClientTest {
         List<String> urls = client.getCandidateUrls();
         assertEquals(4, urls.size());
         assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent", urls.get(0));
-        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent", urls.get(1));
-        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-lite:generateContent", urls.get(2));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent", urls.get(1));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent", urls.get(2));
         assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent", urls.get(3));
     }
 
     @Test
-    void testCandidateUrlsGenerationWith35FlashLitePrimary() {
+    void testCandidateUrlsGenerationWith31FlashLitePrimary() {
+        LlmClient client = new LlmClient(new ObjectMapper(), "key",
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent");
+
+        List<String> urls = client.getCandidateUrls();
+        assertEquals(4, urls.size());
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent", urls.get(0));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent", urls.get(1));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent", urls.get(2));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent", urls.get(3));
+    }
+
+    @Test
+    void testCandidateUrlsDeduplicationWhenConfiguredWithFallbackModel() {
         LlmClient client = new LlmClient(new ObjectMapper(), "key",
                 "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent");
 
         List<String> urls = client.getCandidateUrls();
         assertEquals(4, urls.size());
         assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent", urls.get(0));
-        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-lite:generateContent", urls.get(1));
-        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent", urls.get(2));
-        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent", urls.get(3));
-    }
-
-    @Test
-    void testCandidateUrlsDeduplicationWhenConfiguredWithFallbackModel() {
-        LlmClient client = new LlmClient(new ObjectMapper(), "key",
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-lite:generateContent");
-
-        List<String> urls = client.getCandidateUrls();
-        assertEquals(4, urls.size());
-        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-lite:generateContent", urls.get(0));
-        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent", urls.get(1));
-        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent", urls.get(2));
-        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent", urls.get(3));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent", urls.get(1));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent", urls.get(2));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent", urls.get(3));
     }
 
     @Test

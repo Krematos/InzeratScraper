@@ -17,7 +17,6 @@ import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
@@ -97,7 +96,6 @@ public class MigrationOrchestratorService {
      * Převede zaseknuté záznamy ve stavu PROCESSING starší než timeout zpět na SCRAPED.
      */
     @EventListener(ApplicationReadyEvent.class)
-    @Transactional
     public void onApplicationReady() {
         Instant cutoff = Instant.now().minus(Duration.ofMinutes(processingTimeoutMinutes));
         int recovered = recoverStuckProcessingAds(cutoff);
@@ -123,7 +121,6 @@ public class MigrationOrchestratorService {
         }
     }
 
-    @Transactional
     public int recoverStuckProcessingAds(Instant cutoff) {
         return rawScrapedAdRepository.resetStuckProcessingAds(cutoff);
     }
@@ -273,7 +270,7 @@ public class MigrationOrchestratorService {
             if (json != null && !json.isBlank()) {
                 try {
                     JsonNode root = objectMapper.readTree(json);
-                    String name = root.path("name").asText(null);
+                    String name = root.path("name").asString(null);
                     if (name != null && !name.isBlank()) {
                         adDataCleanerService.registerExistingName(name);
                     }
@@ -384,7 +381,7 @@ public class MigrationOrchestratorService {
         }
         if (e instanceof IOException) {
             String msg = e.getMessage() != null ? e.getMessage() : "";
-            if (e instanceof tools.jackson.core.JacksonException || e instanceof tools.jackson.databind.DatabindException) {
+            if (e instanceof tools.jackson.databind.DatabindException) {
                 return false;
             }
             if (msg.contains("HTTP 400") || msg.contains("HTTP 401") || msg.contains("HTTP 403") || msg.contains("HTTP 404")) {
@@ -398,12 +395,12 @@ public class MigrationOrchestratorService {
     public Instant calculateBackoff(int attempts, Instant now) {
         long baseSeconds = 5L * (1L << Math.min(attempts, 7)); // 10s, 20s, 40s...
         long jitter = ThreadLocalRandom.current().nextLong(-2, 3);
-        long delaySeconds = Math.min(600L, Math.max(2L, baseSeconds + jitter));
+        long delaySeconds = Math.clamp(baseSeconds + jitter, 2L, 600L);
         return now.plusSeconds(delaySeconds);
     }
 
     /**
-     * Vrátí všechny záznamy vyžadující ruční kontrolu v podobě DTO (Fáze 5.4).
+     * Vrátí všechny záznamy vyžadující ruční kontrolu v podobě DTO.
      */
     public List<ReviewItemDto> getAdsNeedingReview() {
         return rawScrapedAdRepository.findAll().stream()

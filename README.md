@@ -6,7 +6,7 @@ Automatizovaný integrační a migrační nástroj pro extrakci inzerátů z baz
 
 ## 🎯 Hlavní vlastnosti a architektura
 
-Projekt řeší kompletní migrační pipeline rozdělenou do 3 fází s mezikrokem v lokálním staging úložišti:
+Projekt řeší kompletní migrační pipeline rozdělenou do fází s mezikrokem v lokálním staging úložišti:
 
 ```
 ┌─────────────────┐       ┌────────────────────────┐       ┌───────────────────────┐
@@ -19,6 +19,13 @@ Projekt řeší kompletní migrační pipeline rozdělenou do 3 fází s mezikro
 │ E-shop (VPS)    │ <──── │ Fáze 3: Synchronizace  │ <──── │ Fáze 2: AI Čištění    │
 │ (REST API)      │       │ (včetně Dry-Run módu)  │       │ & Java Validace       │
 └─────────────────┘       └────────────────────────┘       └───────────────────────┘
+                                                                       │
+                                                                       ▼
+                                                           ┌───────────────────────┐
+                                                           │ Fáze 4–6: Export,     │
+                                                           │ Virtuální vlákna,     │
+                                                           │ Statistiky a Job API  │
+                                                           └───────────────────────┘
 ```
 
 ### 1. Fáze 1: Scraping & Staging úložiště (`BazosScraperService`)
@@ -40,11 +47,33 @@ Projekt řeší kompletní migrační pipeline rozdělenou do 3 fází s mezikro
 - Postupný přenos vyčištěných inzerátů do e-shopu přes zabezpečené interní REST API (`X-API-Key`).
 - Podpora **Dry-Run režimu** (`dryRun=true`), kdy se data pouze zvalidují a vypíšou do logu bez odesílání na server.
 
+### 4. Fáze 4: Paralelní zpracování na virtuálních vláknech
+- Čištění inzerátů běží na lehkých virtuálních vláknech Javy 21+ (`Executors.newVirtualThreadPerTaskExecutor()`).
+- **Bulkhead (Semafor)**: Řízení maximálního souběhu volání LLM API (`llm.max-concurrency`, výchozí 3) pro ochranu před přetížením sítě i databáze.
+- **Atomický claim záznamů**: Zabraňuje souběžnému zpracování stejného inzerátu více vlákny (`UPDATE ... SET status = 'PROCESSING' WHERE id = ... AND status = 'SCRAPED'`).
+- **Graceful shutdown**: Metoda `@PreDestroy` při ukončení aplikace automaticky uvolní rozpracované záznamy ze stavu `PROCESSING` zpět do `SCRAPED`.
+- **Automatická obnova uvízlých úloh**: Watchdog periodicky vrací záznamy zaseknuté v `PROCESSING` déle než stanovený limit (`scraper.processing-timeout-minutes`).
+
+### 5. Fáze 5: Asynchronní úlohy (Clean Job API)
+- Dlouhotrvající operace čištění lze spouštět asynchronně na pozadí (`async=true`, výchozí stav).
+- Klient obdrží odpověď `202 Accepted` s unikátním `jobId` a může sledovat průběh v reálném čase.
+- Ochrana proti souběžnému spuštění více úloh současně (`409 Conflict`).
+
+### 6. Robustní LLM klient & Kaskádový fallback modelů
+- **Pořadí modelů**:
+  1. `gemini-3.1-flash-lite` (primární – nejrychlejší, úsporný a stabilní)
+  2. `gemini-3.5-flash-lite` (1. fallback)
+  3. `gemini-3.6-flash` (2. fallback)
+  4. `gemini-3.8-flash` (3. fallback)
+- **Rychlý fallback**: Timeout požadavku snížen na 15 s (`llm.read-timeout-seconds=15`). Při HTTP 503, 504, 404 nebo vypršení timeoutu klient okamžitě přepíná na další model v řadě.
+- **Rate limiting & Sdílený cooldown**: Omezení frekvence požadavků za minutu (`llm.requests-per-minute`) a koordinovaná sdílená pauza pro všechna vlákna při návratu HTTP 429 na základě hlavičky `Retry-After` nebo exponenciálního backoffu.
+- **Bezpečné logování**: Automatická sanitizace API klíčů v URL a zkracování těl chybových odpovědí na max. 500 znaků.
+
 ---
 
 ## 🛠️ Požadavky na prostředí
 
-- **Java**: verze 21 (JDK 21)
+- **Java**: verze 21+ (doporučeno JDK 21 nebo novější)
 - **Maven**: verze 3.9+ (nebo přibalený `./mvnw`)
 - **Operační systém**: Windows / Linux / macOS
 
@@ -56,8 +85,12 @@ Aplikace se konfiguruje v souboru `src/main/resources/application.properties` ne
 
 | Proměnná prostředí | Výchozí hodnota | Popis |
 |--------------------|-----------------|-------|
-| `LLM_API_URL` | Gemini 3.8 Flash endpoint | URL adresa LLM API (Google Gemini / OpenAI kompatibilní) |
-| `LLM_API_KEY` | *(prázdné)* | API klíč k LLM modelu |
+| `LLM_API_URL` | Gemini 3.1 Flash-Lite endpoint | URL adresa primárního LLM modelu |
+| `LLM_API_KEY` | *(prázdné)* | API klíč k LLM modelu (Google AI Studio / OpenAI) |
+| `LLM_READ_TIMEOUT_SECONDS` | `15` | Read timeout HTTP požadavku na LLM API v sekundách |
+| `LLM_MAX_CONCURRENCY` | `3` | Maximální počet souběžných volání LLM API (bulkhead semafor) |
+| `LLM_REQUESTS_PER_MINUTE` | `10` | Omezení frekvence volání LLM API (RateLimiter) |
+| `LLM_MAX_ATTEMPTS` | `5` | Maximální počet pokusů při přechodných chybách před označením `FAILED` |
 | `ESHOP_REMOTE_URL` | `http://localhost:8080` | Kořenová URL adresa cílového e-shopu |
 | `ESHOP_REMOTE_API_KEY` | *(prázdné)* | Autentizační klíč e-shopu (`X-API-Key`) |
 | `ESHOP_CATEGORIES` | `Elektronika,Nářadí,Ostatní...` | Čárkou oddělený seznam povolených kategorií |
@@ -66,6 +99,7 @@ Aplikace se konfiguruje v souboru `src/main/resources/application.properties` ne
 | `SCRAPER_MAX_PAGES`| `50` | Bezpečnostní limit počtu stránek výpisu |
 | `SCRAPER_MAX_ADS`  | `500` | Bezpečnostní limit celkového počtu inzerátů |
 | `SCRAPER_IMAGES_DIR` | `./data/images` | Složka pro lokální zálohu stažených fotek |
+| `SCRAPER_PROCESSING_TIMEOUT_MINUTES` | `15` | Timeout pro obnovu uvízlých záznamů ve stavu `PROCESSING` |
 
 ---
 
@@ -101,19 +135,70 @@ Stáhne inzeráty do lokální staging databáze a uloží fotografie na disk.
 POST /api/migration/scrape?profileUrl=https://www.bazos.cz/hodnoceni.php?idmail=123456&downloadImages=true
 ```
 
-### 2. Dávkové vyčištění přes AI
-Vezme inzeráty ve stavu `SCRAPED` nebo `FAILED`, provede LLM analýzu a kódovou validaci.
+### 2. Čištění inzerátů přes AI (Asynchronní i synchronní)
+Zpracuje surové záznamy ve stavu `SCRAPED` přes kaskádu LLM modelů a validaci.
 ```http
-POST /api/migration/clean?limit=20
+# Výchozí asynchronní spuštění (vrací 202 Accepted s jobId):
+POST /api/migration/clean?limit=20&retryFailed=false&async=true
+
+# Synchronní spuštění (vrací 200 OK až po dokončení celé dávky):
+POST /api/migration/clean?limit=20&retryFailed=false&async=false
 ```
 
-### 3. Zobrazení inzerátů vyžadujících kontrolu
-Vrátí inzeráty ve stavu `NEEDS_REVIEW` (např. sporná cena, cena v textu, chybějící název).
+### 3. Zjištění stavu asynchronní úlohy
+Dotaz na průběh asynchronního čištění podle `jobId`.
+```http
+GET /api/migration/jobs/{jobId}
+```
+Odpověď:
+```json
+{
+  "jobId": "c8a14b0e-...",
+  "status": "RUNNING",
+  "total": 20,
+  "processed": 8,
+  "succeeded": 7,
+  "failed": 0,
+  "needsReview": 1,
+  "startedAt": "2026-10-24T20:00:00Z",
+  "finishedAt": null
+}
+```
+
+### 4. Přehled počtu inzerátů v jednotlivých fázích
+Vrátí souhrnnou statistiku počtů záznamů napříč všemi stavy.
+```http
+GET /api/migration/stats
+```
+Odpověď:
+```json
+{
+  "SCRAPED": 25,
+  "PROCESSING": 0,
+  "CLEANED": 18,
+  "NEEDS_REVIEW": 2,
+  "FAILED": 0,
+  "SYNCED": 0
+}
+```
+
+### 5. Závěrečný export vyčištěných produktů do JSON
+Vrátí strukturované pole vyčištěných produktů (`CleanedProductDto`). Umožňuje volitelný filtr podle stavu a přímé uložení do souboru `./data/products-export.json`.
+```http
+# Jen výpis JSON do odpovědi:
+GET /api/migration/export?status=CLEANED
+
+# Výpis a zároveň uložení na disk do ./data/products-export.json:
+GET /api/migration/export?status=CLEANED&saveToFile=true
+```
+
+### 6. Zobrazení inzerátů vyžadujících kontrolu
+Vrátí inzeráty ve stavu `NEEDS_REVIEW` (např. sporná cena, cena pouze v textu, chybějící parametry).
 ```http
 GET /api/migration/review
 ```
 
-### 4. Synchronizace do e-shopu
+### 7. Synchronizace do e-shopu
 Odešle vyčištěné produkty do cílového e-shopu.
 ```http
 # Zkušební běh bez odeslání (pouze logování a validace)

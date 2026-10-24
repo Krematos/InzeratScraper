@@ -41,7 +41,7 @@ public class MigrationController {
     }
 
     /**
-     * Fáze 1: Stažení inzerátů z profilu Bazoše do lokální H2 databáze a volitelná záloha fotek.
+     * Stažení inzerátů z profilu Bazoše do lokální H2 databáze a volitelná záloha fotek.
      * Příklad: POST /api/migration/scrape?profileUrl=https://www.bazos.cz/hodnoceni.php?idmail=...&downloadImages=true
      */
     @PostMapping("/scrape")
@@ -58,7 +58,7 @@ public class MigrationController {
     }
 
     /**
-     * Fáze 2 & 5: Vyčištění surových inzerátů ve stavu SCRAPED přes AI.
+     * Vyčištění surových inzerátů ve stavu SCRAPED přes AI.
      * Výchozí chování je asynchronní (async=true), vrací 202 Accepted s {jobId, status}.
      * Parametr async=false zachovává původní synchronní chování (vrací 200 OK s cleanedCount).
      */
@@ -95,7 +95,7 @@ public class MigrationController {
     }
 
     /**
-     * Fáze 5.2: Zjištění stavu asynchronní úlohy čištění podle ID.
+     * Zjištění stavu asynchronní úlohy čištění podle ID.
      * Vrací {jobId, status, total, processed, succeeded, failed, needsReview, startedAt, finishedAt}.
      */
     @GetMapping("/jobs/{jobId}")
@@ -139,7 +139,7 @@ public class MigrationController {
     }
 
     /**
-     * Fáze 3: Synchronizace vyčištěných produktů do e-shopu (podporuje dryRun=true).
+     * Synchronizace vyčištěných produktů do e-shopu (podporuje dryRun=true).
      * Příklad: POST /api/migration/sync?limit=20&dryRun=true
      */
     @PostMapping("/sync")

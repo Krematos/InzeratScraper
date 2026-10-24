@@ -52,12 +52,12 @@ public class LlmClient {
     private static final int MAX_RETRIES_429 = 3;
     public static final Duration DEFAULT_READ_TIMEOUT = Duration.ofSeconds(15);
 
-    // Pořadí fallback modelů: gemini-3.5-flash-lite je rychlý, levný a odolný vůči špičkám
+    // Pořadí modelů: gemini-3.1-flash-lite, gemini-3.5-flash-lite a až potom 3.6 a 3.8
     static final List<String> FALLBACK_MODELS = List.of(
+            "gemini-3.1-flash-lite",
             "gemini-3.5-flash-lite",
-            "gemini-3.8-flash-lite",
-            "gemini-3.8-flash",
-            "gemini-3.6-flash"
+            "gemini-3.6-flash",
+            "gemini-3.8-flash"
     );
 
     private final ObjectMapper objectMapper;
@@ -74,7 +74,7 @@ public class LlmClient {
     private volatile long cooldownUntilNanos = 0L;
 
     public LlmClient(ObjectMapper objectMapper) {
-        this(objectMapper, "", "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent");
+        this(objectMapper, "", "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent");
     }
 
     public LlmClient(ObjectMapper objectMapper, String llmApiKey, String llmApiUrl) {
@@ -117,7 +117,7 @@ public class LlmClient {
     public LlmClient(
             ObjectMapper objectMapper,
             @Value("${llm.api.key:}") String llmApiKey,
-            @Value("${llm.api.url:https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent}") String llmApiUrl,
+            @Value("${llm.api.url:https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent}") String llmApiUrl,
             @Value("${llm.max-concurrency:3}") int maxConcurrency,
             @Value("${llm.read-timeout-seconds:15}") int readTimeoutSeconds,
             RateLimiter rateLimiter) {
@@ -181,16 +181,20 @@ public class LlmClient {
 
         Matcher matcher = MODEL_URL_PATTERN.matcher(llmApiUrl);
         if (matcher.find()) {
-            String prefix = llmApiUrl.substring(0, matcher.start(1));
-            String suffix = llmApiUrl.substring(matcher.end(1));
-            for (String fallbackModel : FALLBACK_MODELS) {
-                String fallbackUrl = prefix + fallbackModel + suffix;
-                if (!urls.contains(fallbackUrl)) {
-                    urls.add(fallbackUrl);
-                }
-            }
+            addFallbackModelUrls(urls, matcher);
         }
         return urls;
+    }
+
+    private void addFallbackModelUrls(List<String> urls, Matcher matcher) {
+        String prefix = llmApiUrl.substring(0, matcher.start(1));
+        String suffix = llmApiUrl.substring(matcher.end(1));
+        for (String fallbackModel : FALLBACK_MODELS) {
+            String fallbackUrl = prefix + fallbackModel + suffix;
+            if (!urls.contains(fallbackUrl)) {
+                urls.add(fallbackUrl);
+            }
+        }
     }
 
     /**
@@ -201,7 +205,6 @@ public class LlmClient {
     public String callLlmApi(String prompt) throws IOException, InterruptedException {
         assertConfigured();
 
-        // Bulkhead omezující maximální souběh volání
         bulkhead.acquire();
         try {
             return doCallLlmApi(prompt);
@@ -216,91 +219,128 @@ public class LlmClient {
 
         for (int i = 0; i < candidateUrls.size(); i++) {
             String currentUrl = candidateUrls.get(i);
-            boolean isGemini = currentUrl.contains("googleapis.com") || currentUrl.contains("gemini");
-            String requestBodyJson = serializeRequestBody(prompt, isGemini);
-            boolean hasNextFallback = (i + 1 < candidateUrls.size());
-            int attempt429 = 0;
-
-            while (true) {
-                // Dodržení sdílené pauzy po HTTP 429
-                awaitCooldownIfActive();
-
-                // Dodržení limitu frekvence požadavků
-                rateLimiter.acquire();
-
-                HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
-                        .uri(URI.create(currentUrl))
-                        .timeout(readTimeout)
-                        .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(requestBodyJson));
-
-                if (isGemini) {
-                    reqBuilder.header("x-goog-api-key", llmApiKey);
-                } else {
-                    reqBuilder.header("Authorization", "Bearer " + llmApiKey);
+            boolean hasNext = (i + 1 < candidateUrls.size());
+            try {
+                return callCandidateUrlWithRetries(currentUrl, prompt, i > 0);
+            } catch (ModelFallbackException e) {
+                if (!hasNext) {
+                    throw resolveFinalException(e);
                 }
-
-                HttpResponse<String> response;
-                try {
-                    response = httpClient.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofString());
-                } catch (HttpTimeoutException | SocketTimeoutException e) {
-                    if (hasNextFallback) {
-                        log.warn("LLM API timeout ({} s) pro model na URL: {}. Přepínám na další model v pořadí fallbacku: {}",
-                                readTimeout.toSeconds(), sanitizeUrl(currentUrl), sanitizeUrl(candidateUrls.get(i + 1)));
-                        lastException = new IOException("LLM API timeout pro URL " + sanitizeUrl(currentUrl) + ": " + e.getMessage(), e);
-                        break;
-                    } else {
-                        throw new IOException("Chyba při volání LLM API (timeout): " + e.getMessage(), e);
-                    }
-                }
-
-                int status = response.statusCode();
-
-                if (status >= 200 && status < 300) {
-                    if (i > 0) {
-                        log.info("Úspěšná odpověď z fallback modelu na URL: {}", sanitizeUrl(currentUrl));
-                    }
-                    return extractTextFromLlmResponse(response.body(), isGemini);
-                }
-
-                //  Ošetření HTTP 429 rate limitu
-                if (status == 429) {
-                    if (attempt429 < MAX_RETRIES_429) {
-                        attempt429++;
-                        long delaySeconds = parseRetryAfterHeader(response);
-                        if (delaySeconds < 0) {
-                            delaySeconds = calculate429BackoffSeconds(attempt429);
-                        }
-                        updateCooldown(Duration.ofSeconds(delaySeconds).toNanos());
-                        log.warn("LLM API rate-limit (HTTP 429) pro {}, pokus {}/{}. Nastaven sdílený cooldown na {} s.",
-                                sanitizeUrl(currentUrl), attempt429, MAX_RETRIES_429, delaySeconds);
-                        continue;
-                    } else {
-                        log.error("LLM API rate-limit (HTTP 429) vyčerpán po {} pokusech pro URL {}.",
-                                MAX_RETRIES_429, sanitizeUrl(currentUrl));
-                        throw new LlmRateLimitException("LLM API rate-limit (HTTP 429) vyčerpán po " +
-                                MAX_RETRIES_429 + " pokusech pro " + sanitizeUrl(currentUrl));
-                    }
-                }
-
-                // Fallback při HTTP 503, 504 a 404 (neexistující / nedostupný model)
-                if ((status == 503 || status == 504 || status == 404) && hasNextFallback) {
-                    log.warn("LLM API vrátilo HTTP {} pro model na URL: {}. Přepínám na další model v pořadí fallbacku: {}",
-                            status, sanitizeUrl(currentUrl), sanitizeUrl(candidateUrls.get(i + 1)));
-                    lastException = new IOException("Chyba při volání LLM API (HTTP " + status + "): " +
-                            truncateForLog(response.body(), MAX_LOG_BODY_LENGTH));
-                    break;
-                }
-
-                throw new IOException("Chyba při volání LLM API (HTTP " + status + "): " +
-                        truncateForLog(response.body(), MAX_LOG_BODY_LENGTH));
+                log.warn("{}. Přepínám na další model v pořadí fallbacku: {}",
+                        e.getMessage(), sanitizeUrl(candidateUrls.get(i + 1)));
+                lastException = e.getCauseException();
             }
         }
+        throw lastException != null ? lastException : new IOException("LLM API volání selhalo pro všechny modely.");
+    }
 
-        if (lastException != null) {
-            throw lastException;
+    private IOException resolveFinalException(ModelFallbackException e) {
+        if (e.isTimeout() && e.getCauseException().getCause() != null) {
+            return new IOException("Chyba při volání LLM API (timeout): " + e.getCauseException().getCause().getMessage(),
+                    e.getCauseException().getCause());
         }
-        throw new IOException("LLM API volání selhalo pro všechny modely.");
+        return e.getCauseException();
+    }
+
+    private String callCandidateUrlWithRetries(String url, String prompt, boolean isFallback)
+            throws IOException, InterruptedException, ModelFallbackException {
+        boolean isGemini = isGeminiUrl(url);
+        String requestBodyJson = serializeRequestBody(prompt, isGemini);
+        int attempt429 = 0;
+
+        while (true) {
+            awaitCooldownIfActive();
+            rateLimiter.acquire();
+            HttpRequest request = buildHttpRequest(url, requestBodyJson, isGemini);
+            HttpResponse<String> response = sendHttpRequest(url, request);
+
+            if (isSuccess(response.statusCode())) {
+                return handleSuccessfulResponse(url, response.body(), isGemini, isFallback);
+            }
+            if (response.statusCode() == 429) {
+                attempt429 = handle429Retry(url, response, attempt429);
+                continue;
+            }
+            handleErrorResponse(url, response);
+        }
+    }
+
+    private String handleSuccessfulResponse(String url, String body, boolean isGemini, boolean isFallback) {
+        if (isFallback) {
+            log.info("Úspěšná odpověď z fallback modelu na URL: {}", sanitizeUrl(url));
+        }
+        return extractTextFromLlmResponse(body, isGemini);
+    }
+
+    private HttpRequest buildHttpRequest(String url, String requestBodyJson, boolean isGemini) {
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(readTimeout)
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(requestBodyJson));
+
+        if (isGemini) {
+            builder.header("x-goog-api-key", llmApiKey);
+        } else {
+            builder.header("Authorization", "Bearer " + llmApiKey);
+        }
+        return builder.build();
+    }
+
+    private HttpResponse<String> sendHttpRequest(String url, HttpRequest request)
+            throws IOException, InterruptedException, ModelFallbackException {
+        try {
+            return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        } catch (HttpTimeoutException | SocketTimeoutException e) {
+            String msg = "LLM API timeout (" + readTimeout.toSeconds() + " s) pro model na URL: " + sanitizeUrl(url);
+            IOException cause = new IOException("LLM API timeout pro URL " + sanitizeUrl(url) + ": " + e.getMessage(), e);
+            throw new ModelFallbackException(msg, cause, true);
+        }
+    }
+
+    private int handle429Retry(String url, HttpResponse<String> response, int attempt429)
+            throws IOException, InterruptedException {
+        if (attempt429 >= MAX_RETRIES_429) {
+            log.error("LLM API rate-limit (HTTP 429) vyčerpán po {} pokusech pro URL {}.",
+                    MAX_RETRIES_429, sanitizeUrl(url));
+            throw new LlmRateLimitException("LLM API rate-limit (HTTP 429) vyčerpán po " +
+                    MAX_RETRIES_429 + " pokusech pro " + sanitizeUrl(url));
+        }
+        int nextAttempt = attempt429 + 1;
+        long delaySeconds = parseRetryAfterHeader(response);
+        if (delaySeconds < 0) {
+            delaySeconds = calculate429BackoffSeconds(nextAttempt);
+        }
+        updateCooldown(Duration.ofSeconds(delaySeconds).toNanos());
+        log.warn("LLM API rate-limit (HTTP 429) pro {}, pokus {}/{}. Nastaven sdílený cooldown na {} s.",
+                sanitizeUrl(url), nextAttempt, MAX_RETRIES_429, delaySeconds);
+        return nextAttempt;
+    }
+
+    private void handleErrorResponse(String url, HttpResponse<String> response)
+            throws IOException, ModelFallbackException {
+        int status = response.statusCode();
+        String truncatedBody = truncateForLog(response.body(), MAX_LOG_BODY_LENGTH);
+        String message = "Chyba při volání LLM API (HTTP " + status + "): " + truncatedBody;
+        IOException ex = new IOException(message);
+
+        if (isFallbackStatus(status)) {
+            String fallbackMsg = "LLM API vrátilo HTTP " + status + " pro model na URL: " + sanitizeUrl(url);
+            throw new ModelFallbackException(fallbackMsg, ex, false);
+        }
+        throw ex;
+    }
+
+    private boolean isFallbackStatus(int status) {
+        return status == 503 || status == 504 || status == 404;
+    }
+
+    private boolean isSuccess(int status) {
+        return status >= 200 && status < 300;
+    }
+
+    private boolean isGeminiUrl(String url) {
+        return url.contains("googleapis.com") || url.contains("gemini");
     }
 
     private void awaitCooldownIfActive() throws InterruptedException {
@@ -326,24 +366,33 @@ public class LlmClient {
             return -1L;
         }
         Optional<String> header = response.headers().firstValue("Retry-After");
-        if (header.isPresent()) {
-            String val = header.get().trim();
-            try {
-                long seconds = Long.parseLong(val);
-                if (seconds > 0) {
-                    return Math.min(120L, seconds);
-                }
-            } catch (NumberFormatException ignored) {
-                try {
-                    ZonedDateTime date = ZonedDateTime.parse(val, DateTimeFormatter.RFC_1123_DATE_TIME);
-                    long seconds = Duration.between(ZonedDateTime.now(), date).toSeconds();
-                    if (seconds > 0) {
-                        return Math.min(120L, seconds);
-                    }
-                } catch (Exception ignoredDate) {
-                    // ignorovat, použije se fallback
-                }
+        if (header.isEmpty()) {
+            return -1L;
+        }
+        return parseRetryAfterValue(header.get().trim());
+    }
+
+    private long parseRetryAfterValue(String val) {
+        try {
+            long seconds = Long.parseLong(val);
+            if (seconds > 0) {
+                return Math.min(120L, seconds);
             }
+        } catch (NumberFormatException ignored) {
+            return parseHttpDateRetryAfter(val);
+        }
+        return -1L;
+    }
+
+    private long parseHttpDateRetryAfter(String val) {
+        try {
+            ZonedDateTime date = ZonedDateTime.parse(val, DateTimeFormatter.RFC_1123_DATE_TIME);
+            long seconds = Duration.between(ZonedDateTime.now(), date).toSeconds();
+            if (seconds > 0) {
+                return Math.min(120L, seconds);
+            }
+        } catch (Exception ignored) {
+            // ignorovat, použije se fallback
         }
         return -1L;
     }
@@ -372,42 +421,51 @@ public class LlmClient {
     }
 
     private String serializeRequestBody(String prompt, boolean isGemini) {
-        if (isGemini) {
-            Map<String, Object> geminiPayload = new LinkedHashMap<>();
-            geminiPayload.put("contents", List.of(
-                    Map.of("parts", List.of(Map.of("text", prompt)))
-            ));
-            geminiPayload.put("generationConfig", Map.of(
-                    "responseMimeType", "application/json",
-                    "temperature", 0.1
-            ));
-            return objectMapper.writeValueAsString(geminiPayload);
-        } else {
-            Map<String, Object> openAiPayload = new LinkedHashMap<>();
-            openAiPayload.put("model", "gpt-4o-mini");
-            openAiPayload.put("messages", List.of(
-                    Map.of("role", "user", KEY_CONTENT, prompt)
-            ));
-            openAiPayload.put("response_format", Map.of("type", "json_object"));
-            openAiPayload.put("temperature", 0.1);
-            return objectMapper.writeValueAsString(openAiPayload);
-        }
+        return isGemini ? serializeGeminiBody(prompt) : serializeOpenAiBody(prompt);
+    }
+
+    private String serializeGeminiBody(String prompt) {
+        Map<String, Object> geminiPayload = new LinkedHashMap<>();
+        geminiPayload.put("contents", List.of(
+                Map.of("parts", List.of(Map.of("text", prompt)))
+        ));
+        geminiPayload.put("generationConfig", Map.of(
+                "responseMimeType", "application/json",
+                "temperature", 0.1
+        ));
+        return objectMapper.writeValueAsString(geminiPayload);
+    }
+
+    private String serializeOpenAiBody(String prompt) {
+        Map<String, Object> openAiPayload = new LinkedHashMap<>();
+        openAiPayload.put("model", "gpt-4o-mini");
+        openAiPayload.put("messages", List.of(
+                Map.of("role", "user", KEY_CONTENT, prompt)
+        ));
+        openAiPayload.put("response_format", Map.of("type", "json_object"));
+        openAiPayload.put("temperature", 0.1);
+        return objectMapper.writeValueAsString(openAiPayload);
     }
 
     private String extractTextFromLlmResponse(String responseBody, boolean isGemini) {
         JsonNode root = objectMapper.readTree(responseBody);
-        if (isGemini) {
-            JsonNode textNode = root.path("candidates").path(0).path(KEY_CONTENT).path("parts").path(0).path("text");
-            if (!textNode.isMissingNode() && !textNode.isNull()) {
-                return textNode.asString();
-            }
-        } else {
-            JsonNode contentNode = root.path("choices").path(0).path("message").path(KEY_CONTENT);
-            if (!contentNode.isMissingNode() && !contentNode.isNull()) {
-                return contentNode.asString();
-            }
+        return isGemini ? extractGeminiText(root, responseBody) : extractOpenAiText(root, responseBody);
+    }
+
+    private String extractGeminiText(JsonNode root, String fallbackBody) {
+        JsonNode textNode = root.path("candidates").path(0).path(KEY_CONTENT).path("parts").path(0).path("text");
+        if (!textNode.isMissingNode() && !textNode.isNull()) {
+            return textNode.asString();
         }
-        return responseBody;
+        return fallbackBody;
+    }
+
+    private String extractOpenAiText(JsonNode root, String fallbackBody) {
+        JsonNode contentNode = root.path("choices").path(0).path("message").path(KEY_CONTENT);
+        if (!contentNode.isMissingNode() && !contentNode.isNull()) {
+            return contentNode.asString();
+        }
+        return fallbackBody;
     }
 
     /**
@@ -417,15 +475,38 @@ public class LlmClient {
         if (rawResponse == null) return "{}";
         String trimmed = rawResponse.trim();
         if (trimmed.startsWith("```")) {
-            String withoutOpeningFence = trimmed.substring(3).trim();
-            if (withoutOpeningFence.toLowerCase(Locale.ROOT).startsWith("json")) {
-                withoutOpeningFence = withoutOpeningFence.substring(4).trim();
-            }
-            trimmed = withoutOpeningFence;
+            trimmed = removeOpeningFence(trimmed);
         }
         if (trimmed.endsWith("```")) {
             trimmed = trimmed.substring(0, trimmed.length() - 3).trim();
         }
         return trimmed;
+    }
+
+    private String removeOpeningFence(String text) {
+        String withoutFence = text.substring(3).trim();
+        if (withoutFence.toLowerCase(Locale.ROOT).startsWith("json")) {
+            withoutFence = withoutFence.substring(4).trim();
+        }
+        return withoutFence;
+    }
+
+    private static class ModelFallbackException extends Exception {
+        private final IOException causeException;
+        private final boolean timeout;
+
+        ModelFallbackException(String message, IOException causeException, boolean timeout) {
+            super(message);
+            this.causeException = causeException;
+            this.timeout = timeout;
+        }
+
+        IOException getCauseException() {
+            return causeException;
+        }
+
+        boolean isTimeout() {
+            return timeout;
+        }
     }
 }
