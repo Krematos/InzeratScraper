@@ -2,6 +2,7 @@ package hanzner.inzeratscraper;
 
 import hanzner.inzeratscraper.dto.CleanedProductDto;
 import hanzner.inzeratscraper.dto.RawAdDto;
+import hanzner.inzeratscraper.dto.ReviewItemDto;
 import hanzner.inzeratscraper.entity.AdProcessingStatus;
 import hanzner.inzeratscraper.entity.RawScrapedAd;
 import hanzner.inzeratscraper.repository.RawScrapedAdRepository;
@@ -400,12 +401,12 @@ class MigrationOrchestratorServiceTest {
 
         when(rawScrapedAdRepository.findAll()).thenReturn(List.of(okAd, needsReviewAd1, needsReviewAd2));
 
-        List<RawScrapedAd> result = orchestratorService.getAdsNeedingReview();
+        List<ReviewItemDto> result = orchestratorService.getAdsNeedingReview();
 
         assertEquals(2, result.size());
-        assertTrue(result.contains(needsReviewAd1));
-        assertTrue(result.contains(needsReviewAd2));
-        assertFalse(result.contains(okAd));
+        assertTrue(result.stream().anyMatch(dto -> "2".equals(dto.externalId())));
+        assertTrue(result.stream().anyMatch(dto -> "3".equals(dto.externalId())));
+        assertFalse(result.stream().anyMatch(dto -> "1".equals(dto.externalId())));
     }
 
     @Test

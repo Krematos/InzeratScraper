@@ -1,24 +1,39 @@
 package hanzner.inzeratscraper;
 
 import hanzner.inzeratscraper.controller.MigrationController;
-import hanzner.inzeratscraper.entity.AdProcessingStatus;
-import hanzner.inzeratscraper.entity.RawScrapedAd;
+import hanzner.inzeratscraper.dto.CleanJobDto;
+import hanzner.inzeratscraper.dto.ReviewItemDto;
+import hanzner.inzeratscraper.service.CleanJobService;
+import hanzner.inzeratscraper.service.JobConflictException;
 import hanzner.inzeratscraper.service.MigrationOrchestratorService;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
+import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @ExtendWith(MockitoExtension.class)
 class MigrationControllerTest {
@@ -26,11 +41,16 @@ class MigrationControllerTest {
     @Mock
     private MigrationOrchestratorService orchestratorService;
 
+    @Mock
+    private CleanJobService cleanJobService;
+
     private MigrationController controller;
+    private MockMvc mockMvc;
 
     @BeforeEach
     void setUp() {
-        controller = new MigrationController(orchestratorService);
+        controller = new MigrationController(orchestratorService, cleanJobService);
+        mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
     }
 
     @Test
@@ -50,7 +70,7 @@ class MigrationControllerTest {
     }
 
     @Test
-    void testCleanStagedAdsEndpoint() {
+    void testCleanStagedAdsSyncEndpoint() {
         when(orchestratorService.cleanStagedAds(15, false)).thenReturn(14);
 
         ResponseEntity<Map<String, Object>> response = controller.cleanStagedAds(15, false);
@@ -65,7 +85,7 @@ class MigrationControllerTest {
     }
 
     @Test
-    void testCleanStagedAdsEndpointWithRetryFailed() {
+    void testCleanStagedAdsSyncEndpointWithRetryFailed() {
         when(orchestratorService.cleanStagedAds(25, true)).thenReturn(20);
 
         ResponseEntity<Map<String, Object>> response = controller.cleanStagedAds(25, true);
@@ -81,19 +101,15 @@ class MigrationControllerTest {
 
     @Test
     void testGetAdsNeedingReviewEndpoint() {
-        RawScrapedAd ad = RawScrapedAd.builder()
-                .externalId("999")
-                .status(AdProcessingStatus.NEEDS_REVIEW)
-                .priceNeedsReview(true)
-                .build();
-        when(orchestratorService.getAdsNeedingReview()).thenReturn(List.of(ad));
+        ReviewItemDto item = new ReviewItemDto("999", "Aku vrtačka", null, "Cena nenalezena", "NEEDS_REVIEW");
+        when(orchestratorService.getAdsNeedingReview()).thenReturn(List.of(item));
 
-        ResponseEntity<List<RawScrapedAd>> response = controller.getAdsNeedingReview();
+        ResponseEntity<List<ReviewItemDto>> response = controller.getAdsNeedingReview();
 
         assertEquals(HttpStatus.OK, response.getStatusCode());
         assertNotNull(response.getBody());
         assertEquals(1, response.getBody().size());
-        assertEquals("999", response.getBody().getFirst().getExternalId());
+        assertEquals("999", response.getBody().getFirst().externalId());
         verify(orchestratorService).getAdsNeedingReview();
     }
 
@@ -110,5 +126,92 @@ class MigrationControllerTest {
         assertEquals(20, response.getBody().get("limit"));
         assertEquals(18, response.getBody().get("processedCount"));
         verify(orchestratorService).syncCleanedAdsToEshop(20, true);
+    }
+
+    // =========================================================================
+    // Testy Fáze 5: Asynchronní job API (MockMvc)
+    // =========================================================================
+
+    @Test
+    @DisplayName("Fáze 5 MockMvc: POST /api/migration/clean vrací 202 Accepted a stav jobu lze dotázat přes GET")
+    void testCleanAsyncReturns202AndStatusCanBeQueried() throws Exception {
+        String jobId = "job-12345";
+        CleanJobDto initialJob = new CleanJobDto(
+                jobId, "RUNNING", 10, 0, 0, 0, 0, Instant.now(), null
+        );
+        CleanJobDto completedJob = new CleanJobDto(
+                jobId, "DONE", 10, 10, 8, 1, 1, Instant.now(), Instant.now()
+        );
+
+        when(cleanJobService.startCleanJob(anyInt(), anyBoolean())).thenReturn(initialJob);
+        when(cleanJobService.getJob(jobId)).thenReturn(Optional.of(completedJob));
+
+        // 1. Spuštění asynchronního jobu -> 202 Accepted
+        mockMvc.perform(post("/api/migration/clean")
+                        .param("limit", "10")
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.jobId").value(jobId))
+                .andExpect(jsonPath("$.status").value("RUNNING"));
+
+        // 2. Dotaz na stav jobu -> 200 OK
+        mockMvc.perform(get("/api/migration/jobs/" + jobId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.jobId").value(jobId))
+                .andExpect(jsonPath("$.status").value("DONE"))
+                .andExpect(jsonPath("$.total").value(10))
+                .andExpect(jsonPath("$.processed").value(10))
+                .andExpect(jsonPath("$.succeeded").value(8))
+                .andExpect(jsonPath("$.failed").value(1))
+                .andExpect(jsonPath("$.needsReview").value(1));
+    }
+
+    @Test
+    @DisplayName("Fáze 5 MockMvc: Druhý souběžný start asynchronního jobu vrací 409 Conflict")
+    void testSecondConcurrentCleanJobReturns409Conflict() throws Exception {
+        when(cleanJobService.startCleanJob(anyInt(), anyBoolean()))
+                .thenThrow(new JobConflictException("Již běží jiný job s ID: job-active"));
+
+        mockMvc.perform(post("/api/migration/clean"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("Již běží jiný job s ID: job-active"));
+    }
+
+    @Test
+    @DisplayName("Fáze 5 MockMvc: Dotaz na neznámé jobId vrací 404 Not Found")
+    void testGetUnknownJobReturns404NotFound() throws Exception {
+        when(cleanJobService.getJob("non-existent-id")).thenReturn(Optional.empty());
+
+        mockMvc.perform(get("/api/migration/jobs/non-existent-id"))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("Fáze 5 MockMvc: async=false zachová původní synchronní chování a vrací 200 OK")
+    void testCleanWithAsyncFalseReturns200Ok() throws Exception {
+        when(orchestratorService.cleanStagedAds(15, false)).thenReturn(10);
+
+        mockMvc.perform(post("/api/migration/clean")
+                        .param("async", "false")
+                        .param("limit", "15"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.phase").value("CLEAN"))
+                .andExpect(jsonPath("$.limit").value(15))
+                .andExpect(jsonPath("$.cleanedCount").value(10));
+    }
+
+    @Test
+    @DisplayName("Fáze 5.4 MockMvc: GET /api/migration/review vrací seznam ReviewItemDto")
+    void testGetReviewEndpointMockMvc() throws Exception {
+        ReviewItemDto item = new ReviewItemDto("ext-42", "Aku vrtačka", new BigDecimal("1200.00"), "Nízká cena", "NEEDS_REVIEW");
+        when(orchestratorService.getAdsNeedingReview()).thenReturn(List.of(item));
+
+        mockMvc.perform(get("/api/migration/review"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].externalId").value("ext-42"))
+                .andExpect(jsonPath("$[0].name").value("Aku vrtačka"))
+                .andExpect(jsonPath("$[0].price").value(1200.00))
+                .andExpect(jsonPath("$[0].reviewReason").value("Nízká cena"))
+                .andExpect(jsonPath("$[0].status").value("NEEDS_REVIEW"));
     }
 }

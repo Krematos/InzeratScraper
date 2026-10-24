@@ -2,6 +2,7 @@ package hanzner.inzeratscraper.service;
 
 import hanzner.inzeratscraper.dto.CleanedProductDto;
 import hanzner.inzeratscraper.dto.RawAdDto;
+import hanzner.inzeratscraper.dto.ReviewItemDto;
 import hanzner.inzeratscraper.entity.AdProcessingStatus;
 import hanzner.inzeratscraper.entity.RawScrapedAd;
 import hanzner.inzeratscraper.repository.RawScrapedAdRepository;
@@ -21,6 +22,7 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.net.SocketTimeoutException;
 import java.net.http.HttpTimeoutException;
 import java.nio.file.Path;
@@ -165,11 +167,18 @@ public class MigrationOrchestratorService {
      * s atomickým claimem a volitelným opakováním FAILED záznamů.
      */
     public int cleanStagedAds(int limit, boolean retryFailed) {
+        return cleanStagedAds(limit, retryFailed, null);
+    }
+
+    /**
+     * Fáze 2, 4 & 5: Vyčistí nezpracované záznamy paralelně přes AI na virtuálních vláknech
+     * s atomickým claimem, volitelným opakováním FAILED záznamů a sledováním průběhu (CleanJobProgress).
+     */
+    public int cleanStagedAds(int limit, boolean retryFailed, CleanJobProgress progress) {
         // 1.5 Fail-fast: ověření konfigurace LLM klíče před jakýmkoliv zásahem do DB
         adDataCleanerService.assertLlmConfigured();
 
-        // 2.2 Předvyplnění unikátních názvů z již zpracovaných záznamů (CLEANED, NEEDS_REVIEW, SYNCED)
-        prefillRegisteredNames();
+        // 2.2 Předvyplnění unikátních názvů z již zpracovaných záznamů (CLEANED, NEEDS_REVIEW, SYNCED)\n        prefillRegisteredNames();
 
         // 1.7 Opakování FAILED záznamů
         if (retryFailed) {
@@ -184,6 +193,10 @@ public class MigrationOrchestratorService {
         List<RawScrapedAd> candidates = rawScrapedAdRepository.findCandidateAdsForProcessing(
                 now, PageRequest.of(0, effectiveLimit)
         );
+
+        if (progress != null) {
+            progress.onTotalKnown(candidates.size());
+        }
 
         log.info("Spouštím Fázi 2 (Čištění přes AI). Nalezeno {} kandidátních SCRAPED záznamů, limit {}.",
                 candidates.size(), effectiveLimit);
@@ -206,7 +219,7 @@ public class MigrationOrchestratorService {
             candidate.setProcessingStartedAt(Instant.now());
 
             CompletableFuture<Boolean> future = CompletableFuture.supplyAsync(
-                    () -> cleanSingleStagedAd(candidate, interrupted),
+                    () -> cleanSingleStagedAd(candidate, interrupted, progress),
                     llmExecutor
             );
             futures.add(future);
@@ -270,7 +283,7 @@ public class MigrationOrchestratorService {
     /**
      * Zpracuje jeden inzerát. Nesmí být @Transactional, aby se nedrželo DB spojení během volání LLM (Fáze 4.3).
      */
-    private boolean cleanSingleStagedAd(RawScrapedAd ad, AtomicBoolean interruptedFlag) {
+    private boolean cleanSingleStagedAd(RawScrapedAd ad, AtomicBoolean interruptedFlag, CleanJobProgress progress) {
         RawAdDto rawDto = new RawAdDto(
                 ad.getExternalId(),
                 ad.getUrl(),
@@ -296,6 +309,9 @@ public class MigrationOrchestratorService {
             ad.setErrorMessage(null);
             ad.setProcessingStartedAt(null);
             rawScrapedAdRepository.save(ad);
+            if (progress != null) {
+                progress.onItemCompleted(ad.getStatus());
+            }
             return true;
         } catch (InterruptedException e) {
             if (interruptedFlag != null) {
@@ -311,12 +327,18 @@ public class MigrationOrchestratorService {
             ad.setProcessingStartedAt(null);
             ad.setErrorMessage("Přerušeno: " + e.getMessage());
             rawScrapedAdRepository.save(ad);
+            if (progress != null) {
+                progress.onItemCompleted(ad.getStatus());
+            }
             return false;
         } catch (Exception e) {
             if (cleanedDto != null) {
                 adDataCleanerService.releaseName(cleanedDto.name());
             }
             handleProcessingError(ad, e);
+            if (progress != null) {
+                progress.onItemCompleted(ad.getStatus());
+            }
             return false;
         }
     }
@@ -375,16 +397,42 @@ public class MigrationOrchestratorService {
     }
 
     /**
-     * Vrátí všechny záznamy vyžadující ruční kontrolu (stav NEEDS_REVIEW nebo priceNeedsReview = true).
+     * Vrátí všechny záznamy vyžadující ruční kontrolu v podobě DTO (Fáze 5.4).
      */
-    public List<RawScrapedAd> getAdsNeedingReview() {
+    public List<ReviewItemDto> getAdsNeedingReview() {
         return rawScrapedAdRepository.findAll().stream()
                 .filter(ad -> ad.getStatus() == AdProcessingStatus.NEEDS_REVIEW || ad.isPriceNeedsReview())
+                .map(this::toReviewItemDto)
                 .toList();
     }
 
+    private ReviewItemDto toReviewItemDto(RawScrapedAd ad) {
+        String name = ad.getRawTitle();
+        BigDecimal price = null;
+        if (ad.getCleanedPayloadJson() != null && !ad.getCleanedPayloadJson().isBlank()) {
+            try {
+                JsonNode root = objectMapper.readTree(ad.getCleanedPayloadJson());
+                if (root.hasNonNull("name")) {
+                    name = root.path("name").asText();
+                }
+                if (root.hasNonNull("price")) {
+                    price = new BigDecimal(root.path("price").asText());
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return new ReviewItemDto(
+                ad.getExternalId(),
+                name,
+                price,
+                ad.getReviewReason(),
+                ad.getStatus() != null ? ad.getStatus().name() : null
+        );
+    }
+
     /**
-     * Fáze 3: Odešle vyčištěné záznamy do e-shopu. Při dryRun = true pouze zaloguje payload bez HTTP volání.\n     */
+     * Fáze 3: Odešle vyčištěné záznamy do e-shopu. Při dryRun = true pouze zaloguje payload bez HTTP volání.
+     */
     public int syncCleanedAdsToEshop(int limit, boolean dryRun) {
         int effectiveLimit = limit > 0 ? limit : 50;
         List<RawScrapedAd> cleanedAds = rawScrapedAdRepository.findByStatus(AdProcessingStatus.CLEANED).stream()
