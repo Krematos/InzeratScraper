@@ -31,7 +31,6 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
 class CleanJobServiceTest {
@@ -56,7 +55,8 @@ class CleanJobServiceTest {
     @Test
     @DisplayName("startCleanJob vrátí jobId ve stavu RUNNING a po dokončení přejde do DONE")
     void testStartCleanJobLifecycle() throws InterruptedException {
-        CountDownLatch latch = new CountDownLatch(1);
+        CountDownLatch jobStartedLatch = new CountDownLatch(1);
+        CountDownLatch resumeJobLatch = new CountDownLatch(1);
 
         doAnswer(inv -> {
             CleanJobProgress progress = inv.getArgument(2);
@@ -66,26 +66,40 @@ class CleanJobServiceTest {
                 progress.onItemCompleted(AdProcessingStatus.NEEDS_REVIEW);
                 progress.onItemCompleted(AdProcessingStatus.FAILED);
             }
-            latch.countDown();
+            jobStartedLatch.countDown();
+            assertTrue(resumeJobLatch.await(5, TimeUnit.SECONDS), "Job měl být uvolněn z pozastavení");
             return 2;
         }).when(orchestratorService).cleanStagedAds(anyInt(), anyBoolean(), any());
 
         CleanJobDto initial = cleanJobService.startCleanJob(10, false);
 
+        // Počká, až mock začne běžet a pozastaví se uvnitř úlohy
+        assertTrue(jobStartedLatch.await(3, TimeUnit.SECONDS), "Úloha měla začít běžet");
+
+        // Dokud je mock pozastaven, job je garantovaně ve stavu RUNNING bez ohledu na rychlost CPU runneru
         assertNotNull(initial.jobId());
+        Optional<CleanJobDto> runningOpt = cleanJobService.getJob(initial.jobId());
+        assertTrue(runningOpt.isPresent());
+        assertEquals("RUNNING", runningOpt.get().status());
         assertEquals("RUNNING", initial.status());
-        assertNotNull(initial.startedAt());
-        assertNull(initial.finishedAt());
+        assertNotNull(runningOpt.get().startedAt());
+        assertNull(runningOpt.get().finishedAt());
 
-        assertTrue(latch.await(3, TimeUnit.SECONDS), "Úloha měla doběhnout");
+        // Uvolní mock, aby mohl job přejít do DONE
+        resumeJobLatch.countDown();
 
-        // Počkáme krátce na propsání DONE ve finally bloku
-        Thread.sleep(50);
+        // Počká na dokončení do stavu DONE (bezpečné dotazování bez náhodných timeoutů)
+        CleanJobDto finished = null;
+        for (int i = 0; i < 50; i++) {
+            Optional<CleanJobDto> current = cleanJobService.getJob(initial.jobId());
+            if (current.isPresent() && CleanJobStatus.DONE.name().equals(current.get().status())) {
+                finished = current.get();
+                break;
+            }
+            Thread.sleep(20);
+        }
 
-        Optional<CleanJobDto> finishedOpt = cleanJobService.getJob(initial.jobId());
-        assertTrue(finishedOpt.isPresent());
-        CleanJobDto finished = finishedOpt.get();
-
+        assertNotNull(finished, "Job měl přejít do stavu DONE");
         assertEquals(CleanJobStatus.DONE.name(), finished.status());
         assertEquals(3, finished.total());
         assertEquals(3, finished.processed());
@@ -120,7 +134,12 @@ class CleanJobServiceTest {
 
         // Uvolnění prvního jobu
         jobHoldLatch.countDown();
-        Thread.sleep(50);
+        for (int i = 0; i < 50; i++) {
+            if (cleanJobService.getActiveJobId().isEmpty()) {
+                break;
+            }
+            Thread.sleep(20);
+        }
 
         // Po skončení prvního jobu již lze spustit další job
         CleanJobDto job2 = cleanJobService.startCleanJob(5, false);
@@ -146,9 +165,16 @@ class CleanJobServiceTest {
 
         CleanJobDto job = cleanJobService.startCleanJob(5, false);
         assertTrue(latch.await(2, TimeUnit.SECONDS));
-        Thread.sleep(50);
 
-        Optional<CleanJobDto> failedOpt = cleanJobService.getJob(job.jobId());
+        Optional<CleanJobDto> failedOpt = Optional.empty();
+        for (int i = 0; i < 50; i++) {
+            failedOpt = cleanJobService.getJob(job.jobId());
+            if (failedOpt.isPresent() && CleanJobStatus.FAILED.name().equals(failedOpt.get().status())) {
+                break;
+            }
+            Thread.sleep(20);
+        }
+
         assertTrue(failedOpt.isPresent());
         assertEquals(CleanJobStatus.FAILED.name(), failedOpt.get().status());
         assertNotNull(failedOpt.get().finishedAt());
